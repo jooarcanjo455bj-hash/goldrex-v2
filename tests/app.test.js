@@ -138,3 +138,29 @@ test('6. admin: salvar inscrição de notificação e chave pública', async () 
   assert.equal((await S.admin.post('/api/admin/push/subscribe', { subscription: { endpoint: 'https://127.0.0.1:9/push/abc123', keys: { p256dh: ua.getPublicKey().toString('base64url'), auth: crypto.randomBytes(16).toString('base64url') } } })).status, 200);
   assert.equal(M.st.tables.settings.find(x => x.key === 'push_subs').value.length, 1);
 });
+
+test('7. card Site: só o admin salva; nome, textos, abas e cores aparecem no site público e voltam ao padrão', async () => {
+  const pub = () => browser().get('/api/site').then(r => r.json.site);
+  const antes = await pub();
+  assert.equal(antes.brand, 'GOLDREX'); assert.equal(antes.colorsOn, false);
+  const dados = await S.admin.get('/api/admin/data'); assert.equal(dados.status, 200);
+  assert.equal(dados.json.site.brand, 'GOLDREX'); const pixAntes = dados.json.pix.key;
+  const corpo = { brand: 'Minha Marca', howto: 'Passo 1\nPasso 2', areas: { fotos: true, videos: false }, colorsOn: true, accent: '#112233', gold: '#aabbcc', bg: '#010203' };
+  assert.ok((await browser().post('/api/admin/site', corpo)).status >= 400, 'sem login não pode salvar');
+  assert.equal((await S.c.post('/api/admin/site', corpo)).status >= 400, true, 'cliente comum não pode salvar');
+  assert.equal((await S.admin.post('/api/admin/site', corpo)).status, 200);
+  const dep = await pub();
+  assert.equal(dep.brand, 'Minha Marca'); assert.equal(dep.howto, 'Passo 1\nPasso 2');
+  assert.deepEqual(dep.areas, { fotos: true, videos: false }); assert.equal(dep.colorsOn, true);
+  assert.equal(dep.accent, '#112233'); assert.equal(dep.gold, '#aabbcc'); assert.equal(dep.bg, '#010203');
+  assert.equal((await S.admin.post('/api/admin/site', { ...corpo, accent: 'vermelho' })).status, 400, 'cor inválida');
+  assert.equal((await S.admin.post('/api/admin/site', { ...corpo, brand: '   ' })).status, 400, 'nome vazio');
+  assert.equal((await pub()).accent, '#112233', 'erro não altera o que já estava salvo');
+  assert.equal((await S.admin.post('/api/admin/site', { ...corpo, brand: 'X'.repeat(80), colorsOn: false })).status, 200);
+  const fim = await pub(); assert.equal(fim.brand.length, 40); assert.equal(fim.colorsOn, false);
+  const d2 = await S.admin.get('/api/admin/data'); assert.equal(d2.json.pix.key, pixAntes, 'o Pix não muda');
+  assert.equal(d2.json.profiles.length, dados.json.profiles.length, 'perfis não mudam');
+  const ajs = (await browser().get('/js/admin.js')).text, pjs = (await browser().get('/js/app.js')).text;
+  assert.ok(ajs.includes("['site','Site','g']") && ajs.includes('function sitesec'), 'card Site no painel');
+  assert.ok(pjs.includes('applyTheme(D.site)'), 'site público aplica o tema');
+});

@@ -157,6 +157,7 @@ const publicSite = input => {
       fotos: areas.fotos === true,
       videos: areas.videos === true
     },
+    colorsOn: x.colorsOn === true,
     counters: x.counters === true,
     howto: S(x.howto || '', 3000)
   };
@@ -387,7 +388,7 @@ async function admData(a) {
   const its = items.map(toItem), IT = new Map(its.map(i => [i.id, i]));
   const orders = orderRows.map(o => ({ id: o.id, code: o.code, user: o.email, title: o.item_id ? (IT.get(o.item_id) || { title: '(conteúdo removido)' }).title : 'Conteúdo', price: o.price_cents, status: o.status, claimed: o.status === 'pending' && o.note === 'CLAIMED', createdAt: ms(o.created_at) }))
     .sort((x, y) => (x.status === 'pending' ? 0 : 1) - (y.status === 'pending' ? 0 : 1) || (+y.claimed - +x.claimed));
-  return { role: 'admin', me: a.username, profiles: profiles.map(toProfile), items: its, orders, stats: { pending: orders.filter(o => o.status === 'pending').length, paid: orders.filter(o => o.status === 'paid').length }, pix: await (async () => { const c = await pixCfg(); return { ...c, code: pix_.payload(c, 0, '') }; })() };
+  return { role: 'admin', me: a.username, site: publicSite((await settings(['site_live'])).site_live), profiles: profiles.map(toProfile), items: its, orders, stats: { pending: orders.filter(o => o.status === 'pending').length, paid: orders.filter(o => o.status === 'paid').length }, pix: await (async () => { const c = await pixCfg(); return { ...c, code: pix_.payload(c, 0, '') }; })() };
 }
 const EXT_SIG = { '.jpg': 'jpg', '.jpeg': 'jpg', '.png': 'png', '.webp': 'webp', '.mp4': 'mp4', '.webm': 'webm', '.mov': 'mov' }, EXT_MIME = { '.jpg': ['image/jpeg'], '.jpeg': ['image/jpeg'], '.png': ['image/png'], '.webp': ['image/webp'], '.mp4': ['video/mp4'], '.webm': ['video/webm'], '.mov': ['video/quicktime', 'video/mp4'] };
 const L = (b, a, z) => b.toString('latin1', a, z), SIG = { jpg: b => b.length > 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF, png: b => b.length >= 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])), webp: b => b.length >= 12 && L(b, 0, 4) === 'RIFF' && L(b, 8, 12) === 'WEBP', webm: b => b.length >= 4 && b[0] === 0x1A && b[1] === 0x45 && b[2] === 0xDF && b[3] === 0xA3, mp4: b => b.length >= 12 && L(b, 4, 8) === 'ftyp', mov: b => b.length >= 12 && (L(b, 4, 8) === 'ftyp' || ['moov', 'mdat', 'wide', 'free', 'skip', 'pnot'].includes(L(b, 4, 8))) };
@@ -472,6 +473,14 @@ async function admApi(req, res, u, p) {
     const clean = { endpoint: s.endpoint, keys: { p256dh: S(s.keys.p256dh, 120), auth: S(s.keys.auth, 60) } };
     const subs = (await setting('push_subs') || []).filter(x => x.endpoint !== clean.endpoint); subs.push(clean);
     await putSetting('push_subs', subs.slice(-10)); return J(res, 200, { ok: 1 });
+  }
+  if (p === '/api/admin/site' && m === 'POST') {
+    b = await body(req); const brand = S(b.brand, 40);
+    if (!brand) return bad(res, 'Informe o nome do site.');
+    const cur = publicSite((await settings(['site_live'])).site_live), ar = b.areas && typeof b.areas === 'object' ? b.areas : {};
+    const next = { ...cur, brand, howto: S(b.howto, 3000), areas: { fotos: ar.fotos === true, videos: ar.videos === true }, colorsOn: b.colorsOn === true };
+    if (next.colorsOn) for (const k of ['accent', 'gold', 'bg']) { if (!/^#[0-9a-fA-F]{6}$/.test(String(b[k]))) return bad(res, 'Cor inválida.'); next[k] = String(b[k]); }
+    await putSetting('site_live', next); await audit(a.username, 'site alterado', ''); return J(res, 200, { ok: 1 });
   }
   if (p === '/api/admin/pix' && m === 'POST') {
     b = await body(req); const key = S(b.key, 140), receiver = S(b.receiver, 25), city = S(b.city, 15);
