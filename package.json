@@ -1,0 +1,17 @@
+{
+  "name": "goldrex",
+  "version": "2.0.0",
+  "private": true,
+  "description": "GOLDREX - plataforma de conteúdo com Pix manual e painel /admin (dados no Supabase)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "reset-admin": "node scripts/reset-admin.js",
+    "limpar-arquivos": "node scripts/limpar-arquivos.js",
+    "sql:juntar": "node scripts/join-sql.js",
+    "test": "node --test tests/app.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
