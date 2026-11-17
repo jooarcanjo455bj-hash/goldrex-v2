@@ -394,7 +394,7 @@ const EXT_SIG = { '.jpg': 'jpg', '.jpeg': 'jpg', '.png': 'png', '.webp': 'webp',
 const L = (b, a, z) => b.toString('latin1', a, z), SIG = { jpg: b => b.length > 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF, png: b => b.length >= 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])), webp: b => b.length >= 12 && L(b, 0, 4) === 'RIFF' && L(b, 8, 12) === 'WEBP', webm: b => b.length >= 4 && b[0] === 0x1A && b[1] === 0x45 && b[2] === 0xDF && b[3] === 0xA3, mp4: b => b.length >= 12 && L(b, 4, 8) === 'ftyp', mov: b => b.length >= 12 && (L(b, 4, 8) === 'ftyp' || ['moov', 'mdat', 'wide', 'free', 'skip', 'pnot'].includes(L(b, 4, 8))) };
 const base = f => path.basename(String(f || ''));
 async function delItem(x) {/* apaga o original (bucket privado), as prévias (bucket público) e a linha do banco */
-  try { await supa.storage.remove('originals', [base(x.file)]); const pv = [x.preview, x.cover, x.teaser].filter(Boolean).map(base); if (pv.length) await supa.storage.remove('previews', pv); } catch (e) { logErr('aviso: arquivo não removido do Storage', e); }
+  try { await supa.storage.remove('originals', (x.files && x.files.length ? x.files : [x.file]).map(base)); const pv = [x.preview, x.cover, x.teaser].filter(Boolean).map(base); if (pv.length) await supa.storage.remove('previews', pv); } catch (e) { logErr('aviso: arquivo não removido do Storage', e); }
   await T.del('items', { id: eq(x.id) });
 }
 const rmPub = async url => { if (url && String(url).startsWith('/uploads/')) try { await supa.storage.remove('previews', [base(url)]); } catch (e) { logErr('aviso: prévia não removida', e); } };
@@ -512,9 +512,10 @@ async function admApi(req, res, u, p) {
     };
     if (!d.title) return bad(res, 'Informe o título.'); if (d.published && !(d.price_cents > 0)) return bad(res, 'Defina um preço maior que zero para publicar.');
     const x0 = b.id && await T.one('items', { id: eq(sid(b.id)) });
+    if (b.bio) d.bio = S(b.bio, 600); else if (x0 && x0.bio) d.bio = '';
     if (x0) { const [r] = await T.patch('items', { id: eq(x0.id) }, d); return J(res, 200, toItem(r)); }
-    const type = b.type === 'video' ? 'video' : 'photo', file = base(S(b.file, 80)); if (!(await T.one('profiles', { id: eq(sid(b.profileId)) }))) return bad(res, 'Escolha o perfil.');
-    if (!/^[\w.\-]{3,80}$/.test(file)) return bad(res, 'Envie o arquivo.'); try { await supa.storage.sign('originals', file, 30); } catch { return bad(res, 'Envie o arquivo.'); }
+    const type = b.type === 'video' ? 'video' : 'photo', list = (Array.isArray(b.files) && b.files.length ? b.files : [b.file]).slice(0, 1000).map(f => base(S(f, 80))), file = list.join(','); if (!(await T.one('profiles', { id: eq(sid(b.profileId)) }))) return bad(res, 'Escolha o perfil.');
+    if (!list.length || !list.every(f => /^[\w.\-]{3,80}$/.test(f))) return bad(res, 'Envie o arquivo.'); try { for (let k = 0; k < list.length; k += 10) await Promise.all(list.slice(k, k + 10).map(f => supa.storage.sign('originals', f, 30))); } catch { return bad(res, 'Envie o arquivo.'); }
     const [r] = await T.insert('items', [{ id: rid(5), profile_id: sid(b.profileId), type, original_file: file, ...d }]); await audit(a.username, type === 'video' ? 'vídeo adicionado' : 'foto adicionada', d.title); return J(res, 200, toItem(r));
   }
   if ((mm = p.match(/^\/api\/admin\/item\/(\w+)$/)) && m === 'DELETE') { const x = await T.one('items', { id: eq(mm[1]) }); if (x) { await delItem(toItem(x)); await audit(a.username, 'item excluído', x.title); } return J(res, 200, { ok: 1 }); }
@@ -598,7 +599,8 @@ const srv = http.createServer(async (req, res) => {
       const o = await T.one('orders', { id: eq(oid), item_id: eq(mm[1]), status: eq('paid') }); if (!o) return deny();
       const au = await T.one('authorizations', { order_id: eq(oid), account_id: eq(o.account_id), item_id: eq(o.item_id), revoked_at: isNull }); if (!au || !o.account_id || !o.item_id || String(au.email || '').toLowerCase() !== String(o.email || '').toLowerCase()) return deny();
       const it = await T.one('items', { id: eq(mm[1]) }); if (!it) return deny();
-      return pipeUpstream(req, res, await openPrivateMedia('originals', base(it.original_file), req.headers.range), MIME[path.extname(it.original_file).toLowerCase()]);
+      const fl = String(it.original_file).split(',').filter(Boolean), nth = Math.max(0, parseInt(u.searchParams.get('n'), 10) || 0); if (nth >= fl.length) return deny();
+      return pipeUpstream(req, res, await openPrivateMedia('originals', base(fl[nth]), req.headers.range), MIME[path.extname(fl[nth]).toLowerCase()]);
     }
     if (p === '/admin.webmanifest') {/* só entrega para quem já está logado no painel (não revela o endereço secreto) */
       const row = await adminCredentialRow(); if (!(await adminSessionOf(req, row && row.value))) return bad(res, 'Não encontrado.', 404);
