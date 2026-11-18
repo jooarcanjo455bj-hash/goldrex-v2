@@ -292,7 +292,7 @@ async function pubApi(req, res, u, p) {
     const its = sel ? await T.get('items', { profile_id: eq(sel.id), published: eq(true), order: 'created_at.desc' }) : [];
     const items = its.map(toItem);
     return J(res, 200, { ageOk, me: ss ? meOut(ss.account) : null, site: publicSite(cfg.site_live), profiles: profs.map(toProfile).map(prPub), profile: sel ? prPub(toProfile(sel)) : null,
-      photos: items.filter(i => i.type === 'photo').map(iPub), videos: items.filter(i => i.type === 'video').map(iPub) });
+      photos: items.filter(i => i.type === 'photo').map(iPub), videos: items.filter(i => i.type === 'video' || i.nv > 0).map(iPub) });
   }
   if (p === '/api/age' && m === 'POST') { if (limited(ip, 'age', 30)) return bad(res, 'Muitas tentativas.', 429); const b = await body(req); if (b.termsAccepted !== true) return bad(res, "Marque a caixa 'Li e aceito' para continuar.", 400); if (b.adult !== true) return bad(res, 'Confirme que você tem 18 anos ou mais.'); setTermsConsent(res); return J(res, 200, { ok: 1 }); }
   if (!hasTermsConsent(req)) return noTerms();
@@ -514,7 +514,7 @@ async function admApi(req, res, u, p) {
     const x0 = b.id && await T.one('items', { id: eq(sid(b.id)) });
     if (b.bio) d.bio = S(b.bio, 600); else if (x0 && x0.bio) d.bio = '';
     if (x0) { const [r] = await T.patch('items', { id: eq(x0.id) }, d); return J(res, 200, toItem(r)); }
-    const type = b.type === 'video' ? 'video' : 'photo', list = (Array.isArray(b.files) && b.files.length ? b.files : [b.file]).slice(0, 1000).map(f => base(S(f, 80))), file = list.join(','); if (!(await T.one('profiles', { id: eq(sid(b.profileId)) }))) return bad(res, 'Escolha o perfil.');
+    const list = (Array.isArray(b.files) && b.files.length ? b.files : [b.file]).slice(0, 1000).map(f => base(S(f, 80))), file = list.join(','), type = list.length && list.every(f => /\.(mp4|webm|mov)$/i.test(f)) ? 'video' : 'photo'; if (!(await T.one('profiles', { id: eq(sid(b.profileId)) }))) return bad(res, 'Escolha o perfil.');
     if (!list.length || !list.every(f => /^[\w.\-]{3,80}$/.test(f))) return bad(res, 'Envie o arquivo.'); try { for (let k = 0; k < list.length; k += 10) await Promise.all(list.slice(k, k + 10).map(f => supa.storage.sign('originals', f, 30))); } catch { return bad(res, 'Envie o arquivo.'); }
     const [r] = await T.insert('items', [{ id: rid(5), profile_id: sid(b.profileId), type, original_file: file, ...d }]); await audit(a.username, type === 'video' ? 'vídeo adicionado' : 'foto adicionada', d.title); return J(res, 200, toItem(r));
   }

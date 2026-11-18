@@ -164,3 +164,30 @@ test('7. card Site: só o admin salva; nome, textos, abas e cores aparecem no si
   assert.ok(ajs.includes("['site','Site','g']") && ajs.includes('function sitesec'), 'card Site no painel');
   assert.ok(pjs.includes('applyTheme(D.site)'), 'site público aplica o tema');
 });
+
+test('8. pack misto (foto + vídeo + bio): um card, um preço, aparece nas duas abas e libera todos os arquivos', async () => {
+  const prof = (await S.admin.get('/api/admin/data')).json.profiles[0];
+  const mp4 = n => { const b = Buffer.alloc(n, 7); b.write('ftyp', 4, 'latin1'); return b; };
+  const pv = await S.admin.api('PUT', '/api/admin/upload?kind=cover&name=p.jpg', { body: tinyJpg(300, 'pm'), headers: { 'content-type': 'image/jpeg' } });
+  const f1 = await S.admin.api('PUT', '/api/admin/upload?kind=photo&name=a.jpg', { body: tinyJpg(2000, 'm1'), headers: { 'content-type': 'image/jpeg' } });
+  const f2 = await S.admin.api('PUT', '/api/admin/upload?kind=photo&name=b.jpg', { body: tinyJpg(2000, 'm2'), headers: { 'content-type': 'image/jpeg' } });
+  const v1 = await S.admin.api('PUT', '/api/admin/upload?kind=video&name=c.mp4', { body: mp4(3000), headers: { 'content-type': 'video/mp4' } });
+  assert.ok(f1.json.file && v1.json.file);
+  const it = await S.admin.post('/api/admin/item', { profileId: prof.id, files: [f1.json.file, f2.json.file, v1.json.file], title: 'Pack completo', price: 9000, preview: pv.json.url, published: true });
+  assert.equal(it.status, 200); assert.equal(it.json.type, 'photo'); assert.equal(it.json.files.length, 3);
+  const site = (await browser().get('/api/site')).json, pk = site.photos.find(x => x.title === 'Pack completo');
+  assert.ok(pk && pk.mixed && pk.nPhotos === 2 && pk.nVideos === 1 && pk.price === 9000, 'card do pack misto');
+  assert.ok(site.videos.some(x => x.id === pk.id), 'pack misto também aparece na aba Vídeos');
+  const solo = await S.admin.post('/api/admin/item', { profileId: prof.id, files: [v1.json.file], title: 'Só vídeo', price: 3000, cover: pv.json.url, published: true });
+  assert.equal(solo.json.type, 'video', 'só vídeos vira item de vídeo');
+  const c = browser(); await c.post('/api/auth/signup', { user: 'pedro', password: 'senha123', password2: 'senha123', termsAccepted: true });
+  const o = await c.post('/api/order', { itemId: it.json.id }); assert.equal(o.status, 200);
+  const oid = (await S.admin.get('/api/admin/data')).json.orders.find(x => x.user === 'pedro').id;
+  assert.equal((await S.admin.post('/api/admin/order/' + oid + '/confirm', {})).status, 200);
+  const m = (await c.post('/api/my', {})).json.orders[0].media;
+  assert.equal(m.urls.length, 3); assert.deepEqual(m.kinds, ['photo', 'photo', 'video']);
+  for (const u of m.urls) assert.equal((await c.get(u)).status, 200);
+  assert.equal((await c.get(m.urls[0].replace(/&n=\d+/, '&n=9'))).status, 403, 'índice fora do pack é negado');
+  const adm = (await S.admin.get('/api/admin/data')).json.items.find(i => i.id === it.json.id);
+  assert.ok(adm.mixed && adm.nPhotos === 2 && adm.nVideos === 1, 'painel recebe os dados do pack misto');
+});
