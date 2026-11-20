@@ -617,7 +617,7 @@ const srv = http.createServer(async (req, res) => {
     if (f === 'admin.html' && !(p === ADMIN_PATH || p === ADMIN_PATH + '/')) return bad(res, 'Não encontrado.', 404);
     if (f === 'admin.html' || f === 'pagamento.html') res.setHeader('X-Robots-Tag', 'noindex');
     const fp = path.join(PUB, f); if (!fp.startsWith(PUB + path.sep)) return bad(res, 'proibido', 403);
-    sendFile(req, res, fp, MIME[path.extname(fp)] || 'application/octet-stream', 'no-cache');
+    sendFile(req, res, fp, MIME[path.extname(fp)] || 'application/octet-stream', 'no-store');
   } catch (e) {
     logErr('erro na requisição ' + req.method + ' ' + String(req.url).split('?')[0], e); if (res.headersSent || !res.writable) return;
     if (e && [400, 408, 413].includes(e.status) && !(e instanceof SupaError)) return bad(res, e.message, e.status);
