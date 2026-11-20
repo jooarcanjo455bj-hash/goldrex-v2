@@ -191,3 +191,17 @@ test('8. pack misto (foto + vídeo + bio): um card, um preço, aparece nas duas 
   const adm = (await S.admin.get('/api/admin/data')).json.items.find(i => i.id === it.json.id);
   assert.ok(adm.mixed && adm.nPhotos === 2 && adm.nVideos === 1, 'painel recebe os dados do pack misto');
 });
+
+test('9. painel: pedido só vai para "Aguardando confirmação" depois que o cliente avisa que pagou', async () => {
+  const ajs = (await browser().get('/js/admin.js')).text;
+  assert.ok(ajs.includes("x.status==='pending'&&x.claimed") && ajs.includes('Ainda não avisou'), 'pedidos abertos ficam separados');
+  const item = (await S.admin.get('/api/admin/data')).json.items[0];
+  const c = browser(); await c.post('/api/auth/login', { user: 'pedro', password: 'senha123' });
+  const o = await c.post('/api/order', { itemId: item.id }); assert.equal(o.status, 200, 'order ' + JSON.stringify(o.json));
+  let ord = (await S.admin.get('/api/admin/data')).json.orders.find(x => x.user === 'pedro' && x.title === item.title);
+  assert.equal(ord.claimed, false, 'só clicou em Comprar: não avisou que pagou');
+  const pd = await c.post('/api/order/' + o.json.token + '/paid', {}); assert.equal(pd.status, 200, 'paid ' + JSON.stringify(pd.json));
+  ord = (await S.admin.get('/api/admin/data')).json.orders.find(x => x.user === 'pedro' && x.title === item.title);
+  assert.equal(ord.claimed, true, 'depois do "Já paguei" vai para confirmação');
+});
+

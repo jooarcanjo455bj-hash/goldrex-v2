@@ -343,7 +343,7 @@ async function pubApi(req, res, u, p) {
       try { await ensureProviderPayment(o); }
       catch (e) { logErr('registro do pagamento do pedido ' + o.code, e); return bad(res, 'Seu pedido foi criado, mas não foi possível preparar o pagamento. Tente novamente em instantes.', 503, { retryable: true, token: o.token }); }
     }
-    push(sse.admins, { t: 'order' }); notifyAdmin('Novo pedido', brl(o.price) + ' · ' + acc.email + ' · ' + it.title);
+    push(sse.admins, { t: 'order' });
     return J(res, 200, { token: o.token });
   }
   let mm;
