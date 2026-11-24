@@ -4,23 +4,22 @@
 const http = require('http'), fs = require('fs'), os = require('os'), path = require('path'), crypto = require('crypto');
 require('./lib/env')(__dirname);
 const { createSupa, SupaError, eq, lt, gt, isNull, inn } = require('./lib/supa');
-const { placeholder } = require('./lib/payments');
-const pix_ = require('./lib/pix');
-const push_ = require('./lib/push');
+const { verifyWebhookSignature, parseWebhookEvent, parsePaymentEvent, createCheckoutLink } = require('./lib/dropfans');
 const createDomain = require('./lib/domain');
 const { id: rid, hash, eq: teq } = require('./lib/util');
 const H = require('./lib/http'), { J, bad, body, cookie, addCookie, mkCookie, limited, isBlocked, strike, clearStrike, MIME, sendFile, pipeUpstream } = H;
 
 const E = process.env, PORT = +E.PORT || 3000, HOST = String(E.HOST || '').trim(), MAXUP = (+E.MAX_UPLOAD_MB || 50) * 1048576, SECURE = E.HTTPS === 'true';
+const DROP_API_BASE = E.NODE_ENV === 'test' && E.DROPFANS_API_BASE ? E.DROPFANS_API_BASE : 'https://www.dropfans.io';
 const STABLE_SECRET = typeof E.APP_SECRET === 'string' && E.APP_SECRET.length >= 32;
 const ADMIN_PATH = '/' + (String(E.ADMIN_PATH || '/admin').replace(/^\/+|\/+$/g, '').replace(/[^\w\-\/]/g, '') || 'admin');
 const PUB = path.join(__dirname, 'public'), TMP = path.join(os.tmpdir(), 'goldrex-uploads');
 const logErr = (w, e) => console.error('[' + new Date().toISOString() + '] ' + w + ': ' + ((e && (e.stack || e.message)) || e));
 
 /* ---------- configuração obrigatória ---------- */
-const missing = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'].filter(k => !E[k]);
+const missing = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_ROLE_KEY'].filter(k => !E[k]);
 if (missing.length) { console.error('\nFaltam variáveis de ambiente: ' + missing.join(', ') + '\nCopie .env.example para .env (local) ou cadastre-as no .env da VPS. Veja docs/SUPABASE.md e docs/HOSTINGER.md.\n'); process.exit(1); }
-if (E.NODE_ENV === 'production' && !/^https:\/\/[^/\s]+$/.test(String(E.SITE_URL || '').replace(/\/+$/, ''))) { console.error('\nEm produção, defina SITE_URL com o endereço público do site, começando com https:// (ex.: https://seudominio.com.br). Ele é usado para validar a origem dos pedidos.\n'); process.exit(1); }
+if (E.NODE_ENV === 'production' && !/^https:\/\/[^/\s]+$/.test(String(E.SITE_URL || '').replace(/\/+$/, ''))) { console.error('\nEm produção, defina SITE_URL com o endereço público do site, começando com https:// (ex.: https://seudominio.com.br). Ele é usado nos links dos e-mails de confirmação e recuperação de senha.\n'); process.exit(1); }
 let SECRET = E.APP_SECRET;
 if (!SECRET || SECRET.length < 32) {
   if (E.NODE_ENV === 'production') { console.error('\nDefina APP_SECRET (mín. 32 caracteres) no ambiente de produção. Sem ele os links de conteúdo deixariam de valer a cada reinício.\n'); process.exit(1); }
@@ -29,10 +28,9 @@ if (!SECRET || SECRET.length < 32) {
 fs.mkdirSync(TMP, { recursive: true });
 try { fs.readdirSync(TMP).forEach(n => { try { fs.unlinkSync(path.join(TMP, n)); } catch { } }); } catch { }
 
-const supa = createSupa({ url: E.SUPABASE_URL, anonKey: E.SUPABASE_ANON_KEY || E.SUPABASE_SERVICE_ROLE_KEY, serviceKey: E.SUPABASE_SERVICE_ROLE_KEY });
-const SITE_MAIL = 'mailto:' + (E.PUSH_CONTACT || 'admin@example.com');
+const supa = createSupa({ url: E.SUPABASE_URL, anonKey: E.SUPABASE_ANON_KEY, serviceKey: E.SUPABASE_SERVICE_ROLE_KEY });
 const T = supa.db, D = createDomain({ supa, env: E });
-const { settings, setting, putSetting, audit, orderEvent, toProfile, prPub, toItem, iPub, toOrder, brl, ms, iso } = D;
+const { settings, setting, putSetting, audit, orderEvent, toProfile, prPub, toItem, iPub, toService, svPub, toOrder, toChat, brl, ms, iso } = D;
 const sign = s => crypto.createHmac('sha256', SECRET).update(s).digest('hex').slice(0, 32);
 const signedCookieSignature = (name, payload) => crypto.createHmac('sha256', SECRET).update(name + '.' + payload).digest('hex');
 function setSignedCookie(res, name, value, maxAge) {
@@ -57,6 +55,7 @@ const hasTermsConsent = req => {
   return !!(consent && consent.purpose === 'terms-v1' && consent.accepted === true);
 };
 const setTermsConsent = res => setSignedCookie(res, TERMS_COOKIE, { purpose: 'terms-v1', accepted: true, exp: Date.now() + TERMS_TTL * 1000 }, TERMS_TTL);
+const clearOAuthCookie = res => addCookie(res, mkCookie('gr_oauth', '', 0, SECURE));
 const safeEqualText = (a, b) => {
   const left = Buffer.from(String(a || '')), right = Buffer.from(String(b || ''));
   return left.length === right.length && left.length > 0 && crypto.timingSafeEqual(left, right);
@@ -131,7 +130,7 @@ async function openPrivateMedia(bucket, key, range) {
 }
 
 /* ---------- tempo real (conexões abertas ficam na memória; é só um aviso, o dado real está no banco) ---------- */
-const sse = { admins: new Set() };
+const sse = { users: new Map(), admins: new Set() };
 const push = (set, ev) => { if (set) set.forEach(r => { try { r.write('data: ' + JSON.stringify(ev) + '\n\n'); } catch { } }); };
 const stream = (req, res, set, cap = 50, done) => { if (set.size >= cap) { res.writeHead(429, { 'Content-Type': 'text/plain' }); return res.end('429'); } res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' }); res.write(': ok\n\n'); set.add(res); const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch { } }, 25000); let ended = false; const end = () => { if (ended) return; ended = true; clearInterval(hb); set.delete(res); if (done) done(); }; req.on('close', end); res.on('error', end); };
 
@@ -155,79 +154,149 @@ const publicSite = input => {
     bg: typeof x.bg === 'string' && color.test(x.bg) ? x.bg : '#07030c',
     areas: {
       fotos: areas.fotos === true,
-      videos: areas.videos === true
+      videos: areas.videos === true,
+      // desativados: o painel nao mostra clientes, entao nao ha tela para atender chat nem gerenciar ao vivo
+      live: false,
+      chat: false
     },
-    colorsOn: x.colorsOn === true,
     counters: x.counters === true,
     howto: S(x.howto || '', 3000)
   };
 };
 const cl = v => { v = Math.round(+v || 0); return Number.isFinite(v) ? Math.min(Math.max(0, v), 1e8) : 0; };
-const payProvider = () => 'manual';/* só Pix manual: o administrador confere e confirma no painel */
-/* Pix: o que o administrador salva no painel vale; se estiver vazio, usa PIX_KEY / PIX_RECEIVER_NAME do .env */
-const pixCfg = async () => { const c = await setting('pix') || {}; return { key: S(c.key, 140) || placeholder(E.PIX_KEY), receiver: S(c.receiver, 25) || placeholder(E.PIX_RECEIVER_NAME), city: S(c.city, 15) || placeholder(E.PIX_CITY) }; };
 const baseUrl = req => (E.SITE_URL || ((req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http')).toString().split(',')[0] + '://' + (req.headers.host || 'localhost'))).replace(/\/+$/, '');
 
-/* ---------- contas de clientes: só usuário + senha (sem e-mail, sem recuperação) ---------- */
-const CLI_COOKIE = 'gr_s', CLI_TTL = 180 * 86400;
-const cliUserOk = v => /^[a-z0-9._-]{3,20}$/.test(v);
-const sess = new Map();/* id da conta -> {account, exp}: cache curto */
+/* ---------- mensagens de erro de login em português ---------- */
+function authMsg(e) {
+  const m = String(e.message || ''), c = (e.body && (e.body.error_code || e.body.code)) || '';
+  if (/invalid login credentials/i.test(m) || c === 'invalid_credentials') return 'E-mail ou senha incorretos.';
+  if (/not confirmed/i.test(m) || c === 'email_not_confirmed') return 'Confirme seu e-mail pelo link que enviamos antes de entrar.';
+  if (/already registered/i.test(m) || c === 'user_already_exists' || c === 'email_exists') return 'Este e-mail já tem conta. Entre ou use "Esqueci a senha".';
+  if (c === 'weak_password' || (/password/i.test(m) && /(short|least|weak|characters)/i.test(m))) return 'Senha fraca: use pelo menos 8 caracteres.';
+  if (e.status === 429 || c === 'over_email_send_rate_limit') return 'Muitas tentativas. Aguarde alguns minutos.';
+  return 'Não foi possível concluir. Tente novamente.';
+}
+
+/* ---------- sessão (Supabase Auth em cookies HttpOnly) ---------- */
+const sess = new Map();/* access_token -> {user, account, exp}: cache curto para não consultar o Auth a cada requisição */
+const setAuthCookies = (res, t) => { addCookie(res, mkCookie('gr_at', t.access_token, 7 * 864e2, SECURE)); addCookie(res, mkCookie('gr_rt', t.refresh_token, 30 * 864e2, SECURE)); };
+const clearAuthCookies = res => { addCookie(res, mkCookie('gr_at', '', 0, SECURE)); addCookie(res, mkCookie('gr_rt', '', 0, SECURE)); };
 async function adminSessionOf(req, credential) {
   const session = parseAdminCookie(req, credential);
   return session ? { ...session, role: 'admin' } : null;
 }
-async function sessionOf(req) {
-  const v = readSignedCookie(req, CLI_COOKIE); if (!v || typeof v.id !== 'string') return null;
-  const c = sess.get(v.id); if (c && c.exp > Date.now()) return c;
-  const account = await T.one('accounts', { id: eq(v.id) }); if (!account) return null;
-  const s = { account, exp: Date.now() + 30e3 }; sess.set(v.id, s); if (sess.size > 5000) sess.clear(); return s;
+async function sessionOf(req, res) {
+  const at = cookie(req, 'gr_at'), rt = cookie(req, 'gr_rt'); if (!at && !rt) return null;
+  const c = at && sess.get(at); if (c && c.exp > Date.now()) return c;
+  let user = null, fresh = null;
+  if (at) { try { user = await supa.auth.getUser(at); } catch (e) { if (!(e instanceof SupaError) || e.status === 0 || e.status >= 500) throw e; } }
+  if (!user && rt) { try { fresh = await supa.auth.refresh(rt); user = fresh.user; } catch (e) { if (!(e instanceof SupaError) || e.status === 0 || e.status >= 500) throw e; } }
+  if (!user) { clearAuthCookies(res); return null; }
+  const account = await D.ensureAccount(user), s = { user, account, exp: Date.now() + 30e3 };
+  if (fresh) { setAuthCookies(res, fresh); sess.set(fresh.access_token, s); } else sess.set(at, s);
+  if (sess.size > 5000) sess.clear();
+  return s;
 }
-const startSession = (res, account) => setSignedCookie(res, CLI_COOKIE, { id: account.id, exp: Date.now() + CLI_TTL * 1000 }, CLI_TTL);
-const meOut = a => ({ user: a.email });
 /* ---------- pedidos ---------- */
 async function ctxFor(orders) {
-  const itemIds = [...new Set(orders.map(o => o.itemId).filter(Boolean))], paidIds = orders.filter(o => o.status === 'paid').map(o => o.id);
-  const [items, auths] = await Promise.all([itemIds.length ? T.get('items', { id: inn(itemIds) }) : [], paidIds.length ? T.get('authorizations', { order_id: inn(paidIds), revoked_at: isNull }) : []]);
-  const IT = new Map(items.map(r => [r.id, toItem(r)]));
+  const itemIds = [...new Set(orders.map(o => o.itemId).filter(Boolean))], svIds = [...new Set(orders.map(o => o.serviceId).filter(Boolean))], paidIds = orders.filter(o => o.status === 'paid').map(o => o.id), orderIds = orders.map(o => o.id);
+  const [items, svs, auths] = await Promise.all([itemIds.length ? T.get('items', { id: inn(itemIds) }) : [], svIds.length ? T.get('live_services', { id: inn(svIds) }) : [], paidIds.length ? T.get('authorizations', { order_id: inn(paidIds), revoked_at: isNull }) : []]);
+  const IT = new Map(items.map(r => [r.id, toItem(r)])), SV = new Map(svs.map(r => [r.id, toService(r, [])]));
   const AU = new Set(orders.filter(o => o.status === 'paid' && o.accountId && o.itemId && auths.some(a => a.order_id === o.id && a.account_id === o.accountId && a.item_id === o.itemId)).map(o => o.id));
-  return { out: o => D.orderOut(o, { item: IT.get(o.itemId), authorized: AU.has(o.id), signMedia }), IT };
+  return { out: o => D.orderOut(o, { item: IT.get(o.itemId), service: SV.get(o.serviceId), authorized: AU.has(o.id), signMedia }), IT, SV };
 }
+const release = o => o.type === 'live' ? T.patch('live_slots', { order_id: eq(o.id) }, { order_id: null }) : Promise.resolve();
 let lastSweep = 0;
-async function sweep() {/* pedidos pendentes há mais de 3 dias são cancelados (mantém o banco enxuto) */
-  if (Date.now() - lastSweep < 600000) return; lastSweep = Date.now();
-  const old = await T.get('orders', { status: eq('pending'), created_at: lt(iso(Date.now() - 3 * 864e5)), limit: 200 });
-  for (const r of old) { const got = await T.patch('orders', { id: eq(r.id), status: eq('pending') }, { status: 'cancelled', note: 'expirou em 3 dias' }); if (got.length) { await T.patch('payments', { order_id: eq(r.id), status: eq('pending') }, { status: 'cancelled' }).catch(() => { }); orderEvent(r.id, 'pending', 'cancelled', 'sistema', 'expirou em 3 dias'); } }
+async function sweep() {/* pedidos ao vivo pendentes há mais de 30 min voltam a liberar o horário */
+  if (Date.now() - lastSweep < 30000) return; lastSweep = Date.now();
+  const old = await T.get('orders', { type: eq('live'), status: eq('pending'), created_at: lt(iso(Date.now() - 30 * 60e3)) });
+  for (const r of old) { const got = await T.patch('orders', { id: eq(r.id), status: eq('pending') }, { status: 'cancelled' }); if (got.length) { await release(toOrder(r)); orderEvent(r.id, 'pending', 'cancelled', 'sistema', 'expirou em 30 min'); } }
 }
-async function notifyAdmin(title, text, orderId) {
-  try {
-    const subs = await setting('push_subs') || [], keep = [];
-    if (!Array.isArray(subs) || !subs.length) return;
-    const vapid = await getVapid(), payload = { title, body: text, url: ADMIN_PATH, orderId: orderId || '' };
-    for (const s of subs) {
-      try { await push_.send(s, payload, vapid, SITE_MAIL); keep.push(s); }
-      catch (e) { if (e && (e.status === 404 || e.status === 410)) continue; keep.push(s); logErr('push', e); }
-    }
-    if (keep.length !== subs.length) await putSetting('push_subs', keep);
-  } catch (e) { logErr('notificação ao administrador', e); }
-}
-async function getVapid() {
-  let v = await setting('vapid');
-  if (!v || !v.publicKey || !v.privateJwk) { v = push_.generateVapid(); await putSetting('vapid', v); }
-  return v;
-}
-async function ensureProviderPayment(order) {
+const liveOrderJobs = new Map();
+const dropfansCheckoutLinks = new Map();
+async function ensureDropFansPayment(order) {
   if (!order.accountId) throw new Error('O pedido precisa estar vinculado a uma conta para registrar o pagamento.');
-  const existing = await T.one('provider_payments', { order_id: eq(order.id) });
+  const existing = await T.one('dropfans_payments', { order_id: eq(order.id) });
   if (existing) return existing;
-  if (!(order.price > 0)) throw new Error('O pedido precisa ter valor maior que zero.');
-  const row = { id: rid(8), order_id: order.id, account_id: order.accountId, reference: 'GR' + order.code, provider: payProvider(), amount_cents: order.price, currency: 'BRL' };
-  try { const [created] = await T.insert('provider_payments', [row]); return created; }
+  const item = order.itemId && await T.one('items', { id: eq(order.itemId) });
+  if (!item || !item.dropfans_product_id || !Number.isSafeInteger(item.dropfans_amount_cents) ||
+      item.dropfans_amount_cents < 500 || item.dropfans_amount_cents > 75000) {
+    throw new Error('Configure o produto e o valor em USD do Dropfans para este conteúdo.');
+  }
+  const row = {
+    id: rid(8), order_id: order.id, account_id: order.accountId, reference: 'GR' + order.code,
+    product_id: item.dropfans_product_id, amount_cents: item.dropfans_amount_cents, currency: 'USD'
+  };
+  try { const [created] = await T.insert('dropfans_payments', [row]); return created; }
   catch (error) {
     if (error.status !== 409) throw error;
-    const raced = await T.one('provider_payments', { order_id: eq(order.id) });
+    const raced = await T.one('dropfans_payments', { order_id: eq(order.id) });
     if (raced) return raced;
     throw error;
   }
+}
+  async function webhookBody(req, limit = 65536) {
+    const chunks = [];
+    let length = 0;
+    for await (const chunk of req) {
+      length += chunk.length;
+      if (length > limit) {
+        const error = new Error('Corpo do webhook excede o limite permitido.');
+        error.status = 413;
+        throw error;
+      }
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks, length);
+  }
+  async function dropfansWebhook(req, res) {
+    if (!E.DROPFANS_WEBHOOK_SECRET || E.DROPFANS_WEBHOOK_SECRET.startsWith('TODO_')) {
+      req.resume();
+      return bad(res, 'Webhook Dropfans não configurado.', 503);
+    }
+    const rawBody = await webhookBody(req);
+    if (!verifyWebhookSignature(rawBody, req.headers['dropfans-signature'], E.DROPFANS_WEBHOOK_SECRET)) {
+      return bad(res, 'Assinatura Dropfans inválida.', 401);
+    }
+    const event = parseWebhookEvent(rawBody, req.headers);
+    if (!event) return bad(res, 'Envelope de webhook Dropfans inválido.', 400);
+    const payment = parsePaymentEvent(event);
+    if (!payment) return bad(res, 'Evento de pagamento Dropfans inválido.', 400);
+    if (payment.ignored) return J(res, 200, { ok: 1, ignored: true });
+
+    const applied = await T.rpc('apply_dropfans_payment', {
+      p_reference: payment.reference,
+      p_product_id: payment.productId,
+      p_amount_cents: payment.amountCents,
+      p_currency: payment.currency,
+      p_event_type: payment.eventType,
+      p_status: payment.status,
+      p_event_id: payment.eventId,
+      p_transaction_id: payment.transactionId,
+      p_auth_id: rid(8)
+    });
+    if (!applied) {
+      console.warn('Webhook Dropfans não aplicado: evento=' + payment.eventId + ' tipo=' + payment.eventType);
+      return bad(res, 'Pagamento não corresponde a um pedido válido.', 409);
+    }
+    push(sse.admins, { t: 'order' });
+    return J(res, 200, { ok: 1 });
+  }
+async function newOrder(acc, f) {
+  const key = [acc.id, f.service_id, f.price_cents, f.notes].join(':');
+  if (liveOrderJobs.has(key)) return liveOrderJobs.get(key);
+  const job = (async () => {
+    const existing = await T.one('orders', { account_id: eq(acc.id), service_id: eq(f.service_id), type: eq('live'), status: eq('pending') });
+    if (existing && existing.notes === f.notes && existing.price_cents === f.price_cents) return toOrder(existing);
+    for (let i = 0; i < 3; i++) {
+      let r; try { [r] = await T.insert('orders', [{ id: rid(8), token: rid(16), code: D.newCode(), account_id: acc.id, email: acc.email, ...f }]); } catch (e) { if (e.status === 409 && i < 2) continue; throw e; }
+      try { await T.insert('payments', [{ id: rid(8), order_id: r.id, method: 'dropfans', amount_cents: r.price_cents, txid: 'GR' + r.code }]); } catch (e) { await T.del('orders', { id: eq(r.id) }).catch(() => { }); throw e; }
+      orderEvent(r.id, null, 'pending', 'cliente', ''); return toOrder(r);
+    }
+  })();
+  liveOrderJobs.set(key, job);
+  try { return await job; }
+  finally { liveOrderJobs.delete(key); }
 }
 async function newItemOrder(acc, item) {
   const id = await T.rpc('create_item_order', {
@@ -243,6 +312,26 @@ async function newItemOrder(acc, item) {
   const row = await T.one('orders', { id: eq(id) });
   if (!row) throw new Error('A criação atômica do pedido não retornou um pedido existente.');
   return toOrder(row);
+}
+/* ---------- chat e robô ---------- */
+const chatOf = async cid => { cid = sid(cid); if (!cid) return null; const r = await T.one('chats', { cid: eq(cid) }); return r ? toChat(r) : null; };
+async function pricesText() {
+  const [items, svs] = await Promise.all([T.get('items', { published: eq(true) }), T.get('live_services', { active: eq(true) })]);
+  const L = [], ph = items.filter(i => i.type === 'photo'), vd = items.filter(i => i.type === 'video'), rg = a => { const p = a.map(x => x.price_cents); return Math.min(...p) === Math.max(...p) ? brl(p[0]) : brl(Math.min(...p)) + ' a ' + brl(Math.max(...p)); };
+  if (ph.length) L.push(`Fotos (${ph.length}): ${rg(ph)} cada, conforme a foto.`); if (vd.length) L.push(`Vídeos (${vd.length}): ${rg(vd)} cada, conforme o vídeo.`);
+  svs.forEach(s => L.push(`Ao vivo · ${s.name}: ${brl(s.price_cents)} (${s.duration_min} min).`)); return L.length ? L.join('\n') : 'Ainda não há itens com preço cadastrado.';
+}
+async function bot(c, nid, R) {
+  const n = R.nodes[nid]; if (!n) return; c.stack = c.stack || []; c.stack.push(nid); let text = n.text || '';
+  if (n.type === 'prices') text += (text ? '\n' : '') + await pricesText();
+  if (n.type === 'human') { c.mode = 'human'; text = R.humanAvailable ? R.msgHuman : R.msgNoHuman; push(sse.admins, { t: 'msg' }); }
+  c.msgs.push({ from: 'bot', text, t: Date.now(), opts: (n.options || []).map(o => ({ label: o.label, next: o.next })), go: n.go || '', node: nid });
+}
+const chatOut = (c, R) => ({ msgs: c.msgs.slice(-300), mode: c.mode, humanAvailable: R.humanAvailable });
+async function touch(c) {
+  c.updated = Date.now(); if (c.msgs.length > 1000) c.msgs = c.msgs.slice(-1000);
+  await T.patch('chats', { cid: eq(c.cid) }, { mode: c.mode, status: c.status, msgs: c.msgs, stack: c.stack || [], updated_at: iso(c.updated) });
+  push(sse.users.get(c.cid), { t: 'msg' }); push(sse.admins, { t: 'msg' });
 }
 
 /* ---------- API pública e do cliente ---------- */
@@ -281,125 +370,256 @@ const originAllowed = req => {
 };
 
 async function pubApi(req, res, u, p) {
-  const m = req.method, ip = ipOf(req);
-  if (m !== 'GET' && (req.headers['x-req'] !== '1' || !originAllowed(req))) return bad(res, 'Requisição inválida.', 403);
-  const noTerms = () => bad(res, "Marque a caixa 'Li e aceito' para continuar.", 403);
+  const m = req.method, ip = ipOf(req), isDropFansHook = p === '/api/webhook/dropfans', isHook = isDropFansHook;
+  if (m !== 'GET' && !isHook && (req.headers['x-req'] !== '1' || !originAllowed(req))) return bad(res, 'Requisição inválida.', 403);
   if (p === '/api/site') {
     await sweep();
-    const ss = cookie(req, CLI_COOKIE) ? await sessionOf(req) : null, ageOk = hasTermsConsent(req);
-    const [cfg, profs] = await Promise.all([settings(['site_live']), ageOk ? T.get('profiles', { published: eq(true), order: 'created_at.asc' }) : []]);
+    const ss = cookie(req, 'gr_at') || cookie(req, 'gr_rt') ? await sessionOf(req, res) : null;
+    const ageOk = hasTermsConsent(req);
+    const wantPreview = ageOk && u.searchParams.get('preview') && ss && ['admin', 'atendente'].includes(ss.account.role);
+    const [cfg, profs, svs] = await Promise.all([settings(['site_live', 'site_draft', 'robot', 'live_loop']), ageOk ? T.get('profiles', { published: eq(true), order: 'created_at.asc' }) : [], ageOk ? T.get('live_services', { active: eq(true), order: 'created_at.asc' }) : []]);
     const sel = profs.find(x => x.id === u.searchParams.get('p')) || profs[0];
     const its = sel ? await T.get('items', { profile_id: eq(sel.id), published: eq(true), order: 'created_at.desc' }) : [];
-    const items = its.map(toItem);
-    return J(res, 200, { ageOk, me: ss ? meOut(ss.account) : null, site: publicSite(cfg.site_live), profiles: profs.map(toProfile).map(prPub), profile: sel ? prPub(toProfile(sel)) : null,
-      photos: items.filter(i => i.type === 'photo').map(iPub), videos: items.filter(i => i.type === 'video' || i.nv > 0).map(iPub) });
+    const items = its.map(toItem), st = wantPreview ? cfg.site_draft : cfg.site_live;
+    return J(res, 200, { ageOk, me: ss ? { email: ss.account.email, role: ss.account.role } : null, site: publicSite(st), profiles: profs.map(toProfile).map(prPub), profile: sel ? prPub(toProfile(sel)) : null,
+      photos: items.filter(i => i.type === 'photo').map(iPub), videos: items.filter(i => i.type === 'video').map(iPub), live: { services: svs.map(r => svPub(toService(r, []))), loop: cfg.live_loop.on ? cfg.live_loop.url : '' },
+      robot: { enabled: cfg.robot.enabled, humanAvailable: cfg.robot.humanAvailable },
+      preview: !!wantPreview && JSON.stringify(cfg.site_draft) !== JSON.stringify(cfg.site_live) });
   }
   if (p === '/api/age' && m === 'POST') { if (limited(ip, 'age', 30)) return bad(res, 'Muitas tentativas.', 429); const b = await body(req); if (b.termsAccepted !== true) return bad(res, "Marque a caixa 'Li e aceito' para continuar.", 400); if (b.adult !== true) return bad(res, 'Confirme que você tem 18 anos ou mais.'); setTermsConsent(res); return J(res, 200, { ok: 1 }); }
-  if (!hasTermsConsent(req)) return noTerms();
-  if (p === '/api/door' && m === 'POST') { if (limited(ip, 'door', 10, 15 * 60e3)) return bad(res, 'Aguarde alguns minutos.', 429); const b = await body(req), w = S(b.word, 60).toLowerCase(), d = await setting('door'); if (!d || !d.salt || !d.hash || !teq(hash(w, d.salt), d.hash)) return bad(res, 'Comando não reconhecido.', 401); return J(res, 200, { go: ADMIN_PATH }); }
+  if (!hasTermsConsent(req) && !isHook) return bad(res, 'Marque a caixa \'Li e aceito\' para continuar.', 403);
+  if (isDropFansHook) {
+    if (m !== 'POST') { res.setHeader('Allow', 'POST'); return bad(res, 'Método não permitido.', 405); }
+    if (limited(ip, 'dropfans-wh', 120)) return bad(res, 'Muitas requisições.', 429);
+    return dropfansWebhook(req, res);
+  }
+  if (p === '/api/door' && m === 'POST') { if (limited(ip, 'door', 10, 15 * 60e3)) return bad(res, 'Aguarde alguns minutos.', 429); const b = await body(req), w = S(b.word, 60).toLowerCase(), d = await setting('door'); if (!d || !d.salt || !d.hash || !teq(hash(w, d.salt), d.hash)) return bad(res, 'Comando n?o reconhecido.', 401); return J(res, 200, { go: ADMIN_PATH }); }
 
   /* --- contas de clientes --- */
-  if (p === '/api/auth/me') { const ss = await sessionOf(req); return J(res, 200, { me: ss ? meOut(ss.account) : null }); }
-  if (p === '/api/auth/signup' && m === 'POST') {
-    if (limited(ip, 'su', 10, 60 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
+  if (p === '/api/auth/me') { const ss = await sessionOf(req, res); return J(res, 200, { me: ss ? { email: ss.account.email, role: ss.account.role } : null }); }
+  if (p === '/api/auth/google/start' && m === 'POST') {
+    if (limited(ip, 'google', 10, 15 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
     const b = await body(req);
-    if (b.termsAccepted !== true) return bad(res, "Marque a caixa 'Li e aceito' para continuar.", 400);
-    const user = S(b.user, 40).toLowerCase(), pw = typeof b.password === 'string' ? b.password : '', pw2 = typeof b.password2 === 'string' ? b.password2 : '';
-    if (!cliUserOk(user)) return bad(res, 'Usuário inválido. Use de 3 a 20 letras minúsculas, números, ponto, hífen ou underline.');
-    if (pw.length < 6 || pw.length > 100) return bad(res, 'A senha precisa ter pelo menos 6 caracteres.');
-    if (pw !== pw2) return bad(res, 'As duas senhas não são iguais.');
-    const salt = crypto.randomBytes(16).toString('hex'), hh = (await deriveAdminHash(pw, salt)).toString('hex');
-    let acc; try { [acc] = await T.insert('accounts', [{ id: crypto.randomUUID(), email: user, pass_salt: salt, pass_hash: hh }]); }
-    catch (e) { if (e instanceof SupaError && e.status === 409) return bad(res, 'Este usuário já existe. Escolha outro.', 409); throw e; }
-    startSession(res, acc); return J(res, 200, { ok: 1, me: meOut(acc) });
+    if (b.termsAccepted !== true || !hasTermsConsent(req)) return bad(res, "Marque a caixa 'Li e aceito' para continuar.", 400);
+    let site;
+    try { site = new URL(E.SITE_URL || baseUrl(req)); } catch { return bad(res, 'A URL do site não está configurada corretamente.', 503); }
+    if (site.protocol !== 'https:' && !(E.NODE_ENV !== 'production' && ['localhost', '127.0.0.1'].includes(site.hostname))) return bad(res, 'O login com Google exige SITE_URL HTTPS.', 503);
+    const state = crypto.randomBytes(32).toString('hex'), verifier = crypto.randomBytes(32).toString('base64url');
+    const challenge = crypto.createHash('sha256').update(verifier).digest('base64url');
+    const redirect = new URL('/api/auth/google/callback', site);
+    redirect.searchParams.set('state', state);
+    setSignedCookie(res, 'gr_oauth', { state, verifier, exp: Date.now() + 10 * 60 * 1000 }, 600);
+    return J(res, 200, { authorizeUrl: supa.auth.googleAuthorizeUrl(redirect.toString(), challenge) });
+  }
+  if (p === '/api/auth/google/callback' && m === 'GET') {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    const flow = readSignedCookie(req, 'gr_oauth');
+    const state = u.searchParams.get('state'), code = u.searchParams.get('code');
+    if (!flow || !safeEqualText(flow.state, state) || !hasTermsConsent(req) || !code || code.length > 4096 || u.searchParams.has('error')) {
+      clearOAuthCookie(res);
+      return bad(res, 'Retorno do Google inválido ou expirado. Tente novamente.', 400);
+    }
+    let session;
+    try { session = await supa.auth.exchangePkce(code, flow.verifier); }
+    catch (e) {
+      clearOAuthCookie(res);
+      if (!(e instanceof SupaError) || e.status === 0 || e.status >= 500) throw e;
+      return bad(res, 'Não foi possível entrar com Google. Tente novamente.', 400);
+    }
+    if (!session || !session.access_token || !session.refresh_token || !session.user || !session.user.id || !mail(String(session.user.email || ''))) {
+      clearOAuthCookie(res);
+      return bad(res, 'O Google não retornou uma conta válida. Tente novamente.', 400);
+    }
+    const account = await D.ensureAccount(session.user);
+    await D.linkLegacyOrders(session.user, account);
+    setAuthCookies(res, session);
+    clearOAuthCookie(res);
+    res.writeHead(303, { Location: '/', 'Cache-Control': 'no-store' });
+    return res.end();
+  }
+  if (p === '/api/auth/signup' && m === 'POST') {
+    if (limited(ip, 'su', 8, 15 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
+    const b = await body(req);
+    if (!hasTermsConsent(req) || b.termsAccepted !== true) return bad(res, "Marque a caixa 'Li e aceito' para continuar.", 400);
+    const em = S(b.email, 120).toLowerCase(), pw = S(b.password, 100); if (!mail(em)) return bad(res, 'Informe um e-mail válido.'); if (pw.length < 8) return bad(res, 'A senha precisa ter pelo menos 8 caracteres.');
+    let r; try { r = await supa.auth.signUp(em, pw, baseUrl(req) + '/'); } catch (e) { if (!(e instanceof SupaError) || e.status === 0 || e.status >= 500) throw e; return bad(res, authMsg(e), e.status === 429 ? 429 : 400); }
+    if (r && r.access_token) { setAuthCookies(res, r); const acc = await D.ensureAccount(r.user); await D.linkLegacyOrders(r.user, acc); return J(res, 200, { ok: 1, me: { email: acc.email, role: acc.role } }); }
+    return J(res, 200, { ok: 1, needsConfirm: true });
   }
   if (p === '/api/auth/login' && m === 'POST') {
-    if (limited(ip, 'li', 30, 15 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
-    const b = await body(req), user = S(b.user, 40).toLowerCase(), key = 'acct:' + user;
-    if (isBlocked(key)) return bad(res, 'Muitas tentativas. Aguarde 15 minutos.', 429);
-    const acc = cliUserOk(user) ? await T.one('accounts', { email: eq(user) }) : null;
-    let ok = false;
-    if (acc && acc.pass_salt && acc.pass_hash) { const got = await deriveAdminHash(typeof b.password === 'string' ? b.password : '', acc.pass_salt), want = Buffer.from(acc.pass_hash, 'hex'); ok = got.length === want.length && crypto.timingSafeEqual(got, want); }
-    if (!ok) { strike(key, 8, 15 * 60e3, 15 * 60e3); return bad(res, 'Usuário ou senha incorretos.', 401); }
-    clearStrike(key); startSession(res, acc); return J(res, 200, { ok: 1, me: meOut(acc) });
+    if (limited(ip, 'li', 20, 15 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
+    const b = await body(req); if (!hasTermsConsent(req) || b.termsAccepted !== true) return bad(res, "Marque a caixa 'Li e aceito' para continuar.", 400);
+    const em = S(b.email, 120).toLowerCase(); if (isBlocked('acct:' + em)) return bad(res, 'Muitas tentativas. Aguarde 15 minutos.', 429);
+    let r; try { r = await supa.auth.signIn(em, S(b.password, 100)); } catch (e) { if (!(e instanceof SupaError) || e.status === 0 || e.status >= 500) throw e; strike('acct:' + em, 10, 15 * 60e3, 15 * 60e3); return bad(res, authMsg(e), e.status === 429 ? 429 : 401); }
+    clearStrike('acct:' + em); const acc = await D.ensureAccount(r.user); await D.linkLegacyOrders(r.user, acc); setAuthCookies(res, r); return J(res, 200, { ok: 1, me: { email: acc.email, role: acc.role } });
   }
-  if (p === '/api/auth/logout' && m === 'POST') { const v = readSignedCookie(req, CLI_COOKIE); if (v) sess.delete(v.id); addCookie(res, mkCookie(CLI_COOKIE, '', 0, SECURE)); return J(res, 200, { ok: 1 }); }
+  if (p === '/api/auth/logout' && m === 'POST') { const at = cookie(req, 'gr_at'); if (at) { sess.delete(at); supa.auth.logout(at); } clearAuthCookies(res); return J(res, 200, { ok: 1 }); }
+  if (p === '/api/auth/recover' && m === 'POST') {
+    if (limited(ip, 'rc', 5, 15 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
+    const b = await body(req), em = S(b.email, 120).toLowerCase(); if (!mail(em)) return bad(res, 'Informe um e-mail válido.');
+    try { await supa.auth.recover(em, baseUrl(req) + '/recuperar'); } catch (e) { if (e.status === 429) return bad(res, 'Aguarde alguns minutos antes de pedir outro e-mail.', 429); if (!(e instanceof SupaError) || e.status === 0 || e.status >= 500) throw e; }
+    return J(res, 200, { ok: 1 });/* resposta igual exista ou não a conta: não revela quem tem cadastro */
+  }
+  if (p === '/api/auth/reset' && m === 'POST') {
+    if (limited(ip, 'rs', 10, 15 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
+    const b = await body(req), tk = S(b.token, 4000), pw = S(b.password, 100); if (!tk) return bad(res, 'Link inválido ou expirado. Peça um novo e-mail de recuperação.'); if (pw.length < 8) return bad(res, 'A senha precisa ter pelo menos 8 caracteres.');
+    try { await supa.auth.updatePassword(tk, pw); } catch (e) { if (!(e instanceof SupaError) || e.status === 0 || e.status >= 500) throw e; return bad(res, e.status === 401 || e.status === 403 ? 'Link inválido ou expirado. Peça um novo e-mail de recuperação.' : authMsg(e), 400); }
+    return J(res, 200, { ok: 1 });
+  }
 
   /* --- pedidos --- */
   if (p === '/api/order' && m === 'POST') {
     if (limited(ip, 'co', 20)) return bad(res, 'Muitas tentativas. Aguarde um minuto.', 429); await sweep();
-    let ss = await sessionOf(req);
-    if (!ss) {/* sem conta: o primeiro pedido cria um convidado invisível, preso a este navegador */
-      if (limited(ip, 'gu', 15, 60 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
-      const [ga] = await T.insert('accounts', [{ id: crypto.randomUUID(), email: 'convidado-' + crypto.randomBytes(4).toString('hex') }]);
-      startSession(res, ga); ss = { account: ga };
-    }
-    const acc = ss.account, b = await body(req);
-    if (!b.itemId) return bad(res, 'Pedido inválido.');
-    const it = await T.one('items', { id: eq(sid(b.itemId)), published: eq(true) }), pr = it && await T.one('profiles', { id: eq(it.profile_id), published: eq(true) });
-    if (!it || !pr) return bad(res, 'Item indisponível.', 404); if (!(it.price_cents > 0)) return bad(res, 'Este item ainda não tem preço definido.');
-    if (await T.count('orders', { account_id: eq(acc.id), status: eq('pending') }) >= 10) {
-      const existing = await T.one('orders', { account_id: eq(acc.id), item_id: eq(it.id), type: eq('item'), status: eq('pending') });
-      if (!existing) return bad(res, 'Você tem muitos pedidos aguardando pagamento. Pague ou aguarde alguns dias.', 429);
-    }
-    const o = await newItemOrder(acc, it);
-    if (o.status === 'paid') return bad(res, 'Você já comprou este item. Veja em Compras.', 409);
+    const ss = await sessionOf(req, res); if (!ss) return bad(res, 'Entre na sua conta para comprar.', 401, { needLogin: true });
+    const acc = ss.account, b = await body(req); let o;
+    if (b.itemId) {
+      const it = await T.one('items', { id: eq(sid(b.itemId)), published: eq(true) }), pr = it && await T.one('profiles', { id: eq(it.profile_id), published: eq(true) });
+      if (!it || !pr) return bad(res, 'Item indisponível.', 404); if (!(it.price_cents > 0)) return bad(res, 'Este item ainda não tem preço definido.');
+      if (!E.DROPFANS_API_KEY || !it.dropfans_product_id || !Number.isSafeInteger(it.dropfans_amount_cents) ||
+          it.dropfans_amount_cents < 500 || it.dropfans_amount_cents > 75000) {
+        return bad(res, 'Pagamento indisponível: configure o Dropfans e o produto deste conteúdo.', 503);
+      }
+      if (await T.count('orders', { account_id: eq(acc.id), status: eq('pending') }) >= 10) {
+        const existing = await T.one('orders', { account_id: eq(acc.id), item_id: eq(it.id), type: eq('item'), status: eq('pending') });
+        if (!existing) return bad(res, 'Há muitos pedidos pendentes. Conclua ou cancele algum antes de criar outro.', 429);
+      }
+      o = await newItemOrder(acc, it);
+      if (o.status === 'paid') return bad(res, 'Você já comprou este item. Veja em Compra.', 409);
+    } else if (b.serviceId) {
+      return bad(res, 'O checkout Dropfans está disponível somente para fotos e vídeos.', 503);
+    } else return bad(res, 'Pedido inválido.');
     if (o.status === 'pending') {
-      try { await ensureProviderPayment(o); }
-      catch (e) { logErr('registro do pagamento do pedido ' + o.code, e); return bad(res, 'Seu pedido foi criado, mas não foi possível preparar o pagamento. Tente novamente em instantes.', 503, { retryable: true, token: o.token }); }
+      try { await ensureDropFansPayment(o); }
+      catch (e) {
+        logErr('registro do pagamento DropFans do pedido ' + o.code, e);
+        return bad(res, 'Seu pedido foi criado, mas não foi possível preparar a área de pagamento. Tente novamente em instantes.', 503, { retryable: true, token: o.token });
+      }
     }
-    push(sse.admins, { t: 'order' });
-    return J(res, 200, { token: o.token, me: meOut(acc) });
+    push(sse.admins, { t: 'order' }); return J(res, 200, { token: o.token });
   }
   let mm;
   const tokenGuard = () => limited(ip, 'ot', 120) || isBlocked('tk:' + ip);
-  if ((mm = p.match(/^\/api\/order\/(\w+)\/paid$/)) && m === 'POST') {/* cliente avisa que já pagou o Pix: só manda notificação ao administrador */
-    if (tokenGuard() || limited(ip, 'claim', 6, 10 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
+  if ((mm = p.match(/^\/api\/order\/(\w+)\/cancel$/)) && m === 'POST') {
+    if (tokenGuard()) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
     const r = await T.one('orders', { token: eq(mm[1]) }); if (!r) { strike('tk:' + ip, 15, 10 * 60e3, 15 * 60e3); return bad(res, 'Pedido não encontrado.', 404); }
-    if (r.status !== 'pending') return J(res, 200, { ok: 1 });
-    if (r.note !== 'CLAIMED') { await T.patch('orders', { id: eq(r.id), status: eq('pending') }, { note: 'CLAIMED' }); }
-    push(sse.admins, { t: 'order' }); if (r.note !== 'CLAIMED') notifyAdmin('Cliente avisou que pagou', brl(r.price_cents) + ' · ' + r.email + ' · pedido ' + r.code, r.id);
-    return J(res, 200, { ok: 1 });
+    const got = await T.patch('orders', { id: eq(r.id), status: eq('pending') }, { status: 'cancelled' }); if (!got.length) return bad(res, 'Só é possível cancelar pedidos pendentes.');
+    await release(toOrder(r)); orderEvent(r.id, 'pending', 'cancelled', 'cliente', ''); audit('cliente', 'pedido cancelado pelo cliente', r.code); push(sse.admins, { t: 'order' }); return J(res, 200, { ok: 1 });
   }
-  if ((mm = p.match(/^\/api\/pagamento\/(\w+)$/)) && m === 'GET') {
+  if ((mm = p.match(/^\/api\/order\/(\w+)$/))) {
+    if (tokenGuard()) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
+    const r = await T.one('orders', { token: eq(mm[1]) }); if (!r) { strike('tk:' + ip, 15, 10 * 60e3, 15 * 60e3); return bad(res, 'Pedido não encontrado.', 404); }
+    const o = toOrder(r), c = await ctxFor([o]);
+    return J(res, 200, c.out(o));
+  }
+  if ((mm = p.match(/^\/api\/dropfans\/(\w+)$/)) && m === 'GET') {
     if (tokenGuard()) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
     const row = await T.one('orders', { token: eq(mm[1]) });
     if (!row) { strike('tk:' + ip, 15, 10 * 60e3, 15 * 60e3); return bad(res, 'Pedido não encontrado.', 404); }
     const o = toOrder(row);
-    let payment = await T.one('provider_payments', { order_id: eq(o.id) });
-    if (!payment && o.status === 'pending' && o.accountId) payment = await ensureProviderPayment(o);
-    const status = o.status === 'paid' || (payment && payment.status === 'confirmed') ? 'confirmed' : o.status !== 'pending' ? 'failed' : 'pending';
-    const px = status === 'pending' ? await pixCfg() : { key: '', receiver: '' };
-    return J(res, 200, { status, reference: payment ? payment.reference : 'GR' + o.code, amountCents: o.price, claimed: row.note === 'CLAIMED',
-      pixKey: px.key, pixReceiver: px.receiver, pixCode: px.key ? pix_.payload(px, o.price, 'GR' + o.code) : '' });
+    let payment = await T.one('dropfans_payments', { order_id: eq(o.id) });
+    if (!payment && o.status === 'pending') {
+      if (!o.accountId) return bad(res, 'Entre na sua conta para preparar este pagamento.', 409);
+      payment = await ensureDropFansPayment(o);
+    }
+    const status = payment && ['refunded', 'chargeback'].includes(payment.status) ? payment.status
+      : o.status === 'paid' || payment && payment.status === 'confirmed' ? 'confirmed'
+      : o.status !== 'pending' || payment && payment.status === 'failed' ? 'failed' : 'pending';
+    let checkoutUrl = '';
+    if (status === 'pending') {
+      if (!E.DROPFANS_API_KEY || !payment || !payment.product_id) return bad(res, 'Checkout Dropfans indisponível; a integração ainda não está configurada.', 503);
+      try {
+        checkoutUrl = dropfansCheckoutLinks.get(payment.reference);
+        if (!checkoutUrl) {
+          checkoutUrl = await createCheckoutLink({
+            apiKey: E.DROPFANS_API_KEY,
+            productId: payment.product_id,
+            externalRef: payment.reference,
+            apiBase: DROP_API_BASE
+          });
+          dropfansCheckoutLinks.set(payment.reference, checkoutUrl);
+          if (dropfansCheckoutLinks.size > 1000) dropfansCheckoutLinks.delete(dropfansCheckoutLinks.keys().next().value);
+        }
+      } catch (error) {
+        console.error('Falha ao criar link de checkout Dropfans: ' + error.message);
+        return bad(res, 'Não foi possível preparar o checkout Dropfans. Tente novamente.', 503);
+      }
+    }
+    return J(res, 200, {
+      status,
+      reference: payment ? payment.reference : 'GR' + o.code,
+      amountCents: o.price,
+      providerAmountCents: payment && payment.amount_cents,
+      providerCurrency: payment && payment.currency,
+      checkoutUrl
+    });
   }
   if (p === '/api/my' && m === 'POST') {
-    if (limited(ip, 'my', 60)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
-    const ss = await sessionOf(req); if (!ss) return J(res, 200, { orders: [], needLogin: true });
+    if (limited(ip, 'my', 60)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429); await sweep();
+    const ss = await sessionOf(req, res); if (!ss) return J(res, 200, { orders: [], needLogin: true });
     const orders = (await T.get('orders', { account_id: eq(ss.account.id), order: 'created_at.desc', limit: 100 })).map(toOrder), c = await ctxFor(orders);
     return J(res, 200, { orders: orders.map(o => c.out(o)) });
+  }
+
+  /* --- chat --- */
+  if (p === '/api/chat/open' && m === 'POST') {
+    if (limited(ip, 'ch', 20)) return bad(res, 'Muitas tentativas.', 429); const b = await body(req); let c = await chatOf(b.cid);
+    if (!c) { const R = await setting('robot'), em = S(b.email, 120).toLowerCase(); c = { cid: rid(16), id: rid(4), email: mail(em) ? em : '', mode: R.enabled ? 'bot' : 'human', status: 'open', msgs: [], stack: [] }; await T.insert('chats', [{ cid: c.cid, id: c.id, email: c.email, mode: c.mode, status: c.status }]); if (R.enabled) await bot(c, R.start, R); await touch(c); }
+    return J(res, 200, { cid: c.cid });
+  }
+  if (p === '/api/chat/send' && m === 'POST') {
+    if (limited(ip, 'ch', 30)) return bad(res, 'Muitas mensagens. Aguarde um minuto.', 429); const b = await body(req), c = await chatOf(b.cid); if (!c) return bad(res, 'Conversa não encontrada.', 404); const R = await setting('robot'); c.status = 'open';
+    if (b.choice !== undefined) { const last = [...c.msgs].reverse().find(x => x.from === 'bot'), o = last && last.opts && last.opts[+b.choice]; if (!o) return bad(res, 'Opção inválida.'); c.msgs.push({ from: 'user', text: o.label, t: Date.now() }); c.mode = 'bot'; await bot(c, o.next, R); }
+    else { const t = S(b.text, 1000); if (!t) return bad(res, 'Mensagem vazia.'); c.msgs.push({ from: 'user', text: t, t: Date.now(), read: false }); if (c.mode === 'bot' && R.enabled) c.msgs.push({ from: 'bot', text: R.msgFallback, t: Date.now(), opts: ((R.nodes[R.start] || {}).options || []).map(o => ({ label: o.label, next: o.next })), node: R.start }); }
+    await touch(c); return J(res, 200, { ok: 1 });
+  }
+  if ((mm = p.match(/^\/api\/chat\/(\w+)\/back$/)) && m === 'POST') { const c = await chatOf(mm[1]); if (!c) return bad(res, 'Conversa não encontrada.', 404); const R = await setting('robot'); c.msgs.push({ from: 'user', text: 'Voltar', t: Date.now() }); c.mode = 'bot'; c.stack = c.stack || []; c.stack.pop(); const prev = c.stack.pop(); await bot(c, prev && R.nodes[prev] ? prev : R.start, R); await touch(c); return J(res, 200, { ok: 1 }); }
+  if ((mm = p.match(/^\/api\/chat\/stream\/(\w+)$/))) { const cid = mm[1]; if (limited(ip, 'sse', 30) || !(await chatOf(cid))) return bad(res, 'Conversa não encontrada.', 404); if (!sse.users.has(cid)) sse.users.set(cid, new Set()); const set = sse.users.get(cid); return stream(req, res, set, 5, () => { if (!set.size && sse.users.get(cid) === set) sse.users.delete(cid); }); }
+  if ((mm = p.match(/^\/api\/chat\/(\w+)$/))) {
+    if (limited(ip, 'cg', 180)) return bad(res, 'Muitas requisições.', 429); const c = await chatOf(mm[1]); if (!c) return bad(res, 'Conversa não encontrada.', 404);
+    if (c.msgs.some(x => x.from === 'admin' && !x.read)) { c.msgs.forEach(x => { if (x.from === 'admin') x.read = true; }); await T.patch('chats', { cid: eq(c.cid) }, { msgs: c.msgs }); }
+    return J(res, 200, chatOut(c, await setting('robot')));
   }
   bad(res, 'Rota não encontrada.', 404);
 }
 
 /* ---------- API do painel administrativo ---------- */
 const pf = b => ({ name: S(b.name, 60), username: S(b.user, 40).replace(/^@?/, '@'), bio: S(b.bio, 200), avatar: up(b.avatar), verified: !!b.verified, published: !!b.published });
+const chatsList = (rows, full = true) => rows.map(toChat).map(c => ({ cid: c.cid, id: c.id, ...(full ? { email: c.email } : {}), emailM: mask(c.email), mode: c.mode, status: c.status, msgs: c.msgs, updated: c.updated, pending: c.status === 'open' && c.msgs.length && c.msgs[c.msgs.length - 1].from === 'user' })).sort((a, b) => b.updated - a.updated);
 async function admData(a) {
-  const [profiles, items, orderRows] = await Promise.all([
+  const [profiles, items, orderRows, dropfansRows] = await Promise.all([
     T.get('profiles', { order: 'created_at.asc' }),
     T.get('items', { order: 'created_at.desc' }),
-    T.get('orders', { order: 'created_at.desc', limit: 300 })
+    T.get('orders', { order: 'created_at.desc', limit: 1000 }),
+    T.get('dropfans_payments', { order: 'created_at.desc', limit: 1000 })
   ]);
   const its = items.map(toItem), IT = new Map(its.map(i => [i.id, i]));
-  const orders = orderRows.map(o => ({ id: o.id, code: o.code, user: o.email, title: o.item_id ? (IT.get(o.item_id) || { title: '(conteúdo removido)' }).title : 'Conteúdo', price: o.price_cents, status: o.status, claimed: o.status === 'pending' && o.note === 'CLAIMED', createdAt: ms(o.created_at) }))
-    .sort((x, y) => (x.status === 'pending' ? 0 : 1) - (y.status === 'pending' ? 0 : 1) || (+y.claimed - +x.claimed));
-  return { role: 'admin', me: a.username, site: publicSite((await settings(['site_live'])).site_live), profiles: profiles.map(toProfile), items: its, orders, stats: { pending: orders.filter(o => o.status === 'pending').length, paid: orders.filter(o => o.status === 'paid').length }, pix: await (async () => { const c = await pixCfg(); return { ...c, code: pix_.payload(c, 0, '') }; })() };
+  const providerPayments = new Map(dropfansRows.map(payment => [payment.order_id, payment]));
+  const safeOrders = orderRows.map(order => ({
+    id: order.id,
+    code: order.code,
+    title: order.item_id ? (IT.get(order.item_id) || { title: '(conteúdo removido)' }).title : 'Conteúdo',
+    price: order.price_cents,
+    status: order.status,
+    paymentStatus: (providerPayments.get(order.id) || {}).status || order.status
+  }));
+  return {
+    role: 'admin',
+    me: a.username,
+    profiles: profiles.map(toProfile),
+    items: its,
+    orders: safeOrders,
+    stats: {
+      pending: safeOrders.filter(order => order.paymentStatus === 'pending').length,
+      paid: safeOrders.filter(order => order.paymentStatus === 'confirmed').length
+    }
+  };
 }
 const EXT_SIG = { '.jpg': 'jpg', '.jpeg': 'jpg', '.png': 'png', '.webp': 'webp', '.mp4': 'mp4', '.webm': 'webm', '.mov': 'mov' }, EXT_MIME = { '.jpg': ['image/jpeg'], '.jpeg': ['image/jpeg'], '.png': ['image/png'], '.webp': ['image/webp'], '.mp4': ['video/mp4'], '.webm': ['video/webm'], '.mov': ['video/quicktime', 'video/mp4'] };
 const L = (b, a, z) => b.toString('latin1', a, z), SIG = { jpg: b => b.length > 3 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF, png: b => b.length >= 8 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])), webp: b => b.length >= 12 && L(b, 0, 4) === 'RIFF' && L(b, 8, 12) === 'WEBP', webm: b => b.length >= 4 && b[0] === 0x1A && b[1] === 0x45 && b[2] === 0xDF && b[3] === 0xA3, mp4: b => b.length >= 12 && L(b, 4, 8) === 'ftyp', mov: b => b.length >= 12 && (L(b, 4, 8) === 'ftyp' || ['moov', 'mdat', 'wide', 'free', 'skip', 'pnot'].includes(L(b, 4, 8))) };
 const base = f => path.basename(String(f || ''));
 async function delItem(x) {/* apaga o original (bucket privado), as prévias (bucket público) e a linha do banco */
-  try { await supa.storage.remove('originals', (x.files && x.files.length ? x.files : [x.file]).map(base)); const pv = [x.preview, x.cover, x.teaser].filter(Boolean).map(base); if (pv.length) await supa.storage.remove('previews', pv); } catch (e) { logErr('aviso: arquivo não removido do Storage', e); }
+  try { await supa.storage.remove('originals', [base(x.file)]); const pv = [x.preview, x.cover, x.teaser].filter(Boolean).map(base); if (pv.length) await supa.storage.remove('previews', pv); } catch (e) { logErr('aviso: arquivo não removido do Storage', e); }
   await T.del('items', { id: eq(x.id) });
 }
 const rmPub = async url => { if (url && String(url).startsWith('/uploads/')) try { await supa.storage.remove('previews', [base(url)]); } catch (e) { logErr('aviso: prévia não removida', e); } };
@@ -418,14 +638,7 @@ async function admApi(req, res, u, p) {
     if (!username) return bad(res, 'Usuário inválido. Use de 3 a 32 letras, números, ponto, hífen ou underline.', 400);
     if (password.length < 8 || password.length > 128) return bad(res, 'A senha deve ter entre 8 e 128 caracteres.', 400);
     const existing = await adminCredentialRow();
-    if (existing) {/* já existe acesso: só substitui quem tem o código de segurança do servidor (ADMIN_SETUP_CODE ou, se não houver, o APP_SECRET do .env) */
-      const need = String(E.ADMIN_SETUP_CODE || '') || E.APP_SECRET;
-      if (!safeEqualText(b.setupCode, need)) return bad(res, 'Código de segurança incorreto.', 403);
-      const fresh = await makeAdminCredential(username, password);
-      await T.patch('settings', { key: eq('admin_credential') }, { value: fresh, updated_at: new Date().toISOString() });
-      clearAdminCookie(res); await audit(username, 'acesso administrativo recriado', '');
-      return J(res, 200, { ok: 1 });
-    }
+    if (existing) return bad(res, 'Cadastro encerrado.', 409);
     const credential = await makeAdminCredential(username, password);
     try {
       await T.insert('settings', [{ key: 'admin_credential', value: credential, updated_at: new Date().toISOString() }]);
@@ -437,14 +650,14 @@ async function admApi(req, res, u, p) {
     return J(res, 200, { ok: 1 });
   }
   if (p === '/api/admin/login' && m === 'POST') {
-    if (limited(ip, 'alog', 20, 2 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde 2 minutos.', 429);
+    if (limited(ip, 'alog', 15, 15 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde 15 minutos.', 429);
     const b = await body(req), username = adminUsername(b.username), password = adminPassword(b.password);
     const key = 'admin:' + (username || 'invalid');
     if (!STABLE_SECRET) return bad(res, 'A autenticação administrativa não está configurada corretamente.', 503);
-    if (isBlocked(key)) return bad(res, 'Muitas tentativas. Aguarde 2 minutos.', 429);
+    if (isBlocked(key)) return bad(res, 'Muitas tentativas. Aguarde 15 minutos.', 429);
     const row = await adminCredentialRow(), credential = row && row.value;
     const valid = await verifyAdminCredential(credential, username, password);
-    if (!valid) { strike(key, 10, 5 * 60e3, 2 * 60e3); return bad(res, 'Usuário ou senha inválidos.', 401); }
+    if (!valid) { strike(key, 10, 15 * 60e3, 15 * 60e3); return bad(res, 'Usuário ou senha inválidos.', 401); }
     clearStrike(key);
     setAdminCookie(res, credential, b.remember === true);
     await audit(username, 'login no painel', '');
@@ -471,28 +684,9 @@ async function admApi(req, res, u, p) {
     await audit(username, 'credenciais administrativas alteradas', '');
     return J(res, 200, { ok: 1 });
   }
-  if (p === '/api/admin/push/key' && m === 'GET') return J(res, 200, { key: (await getVapid()).publicKey });
-  if (p === '/api/admin/push/subscribe' && m === 'POST') {
-    b = await body(req); const s = b.subscription;
-    if (!s || typeof s.endpoint !== 'string' || !/^https:\/\/[^\s]{10,600}$/.test(s.endpoint) || !s.keys || typeof s.keys.p256dh !== 'string' || typeof s.keys.auth !== 'string') return bad(res, 'Inscrição inválida.');
-    const clean = { endpoint: s.endpoint, keys: { p256dh: S(s.keys.p256dh, 120), auth: S(s.keys.auth, 60) } };
-    const subs = (await setting('push_subs') || []).filter(x => x.endpoint !== clean.endpoint); subs.push(clean);
-    await putSetting('push_subs', subs.slice(-10)); return J(res, 200, { ok: 1 });
-  }
-  if (p === '/api/admin/site' && m === 'POST') {
-    b = await body(req); const brand = S(b.brand, 40);
-    if (!brand) return bad(res, 'Informe o nome do site.');
-    const cur = publicSite((await settings(['site_live'])).site_live), ar = b.areas && typeof b.areas === 'object' ? b.areas : {};
-    const next = { ...cur, brand, howto: S(b.howto, 3000), areas: { fotos: ar.fotos === true, videos: ar.videos === true }, colorsOn: b.colorsOn === true };
-    if (next.colorsOn) for (const k of ['accent', 'gold', 'bg']) { if (!/^#[0-9a-fA-F]{6}$/.test(String(b[k]))) return bad(res, 'Cor inválida.'); next[k] = String(b[k]); }
-    await putSetting('site_live', next); await audit(a.username, 'site alterado', ''); return J(res, 200, { ok: 1 });
-  }
-  if (p === '/api/admin/pix' && m === 'POST') {
-    b = await body(req); const key = S(b.key, 140), receiver = S(b.receiver, 25), city = S(b.city, 15);
-    if (!key) return bad(res, 'Informe a chave Pix.');
-    if (!receiver) return bad(res, 'Informe o nome de quem recebe.');
-    await putSetting('pix', { key, receiver, city }); await audit(a.username, 'chave Pix alterada', ''); return J(res, 200, { ok: 1 });
-  }
+  if (p === '/api/admin/available' && m === 'POST') { b = await body(req); const R = await setting('robot'); R.humanAvailable = !!b.on; await putSetting('robot', R); await audit(a.username, 'atendente ' + (b.on ? 'disponível' : 'indisponível'), ''); push(sse.admins, { t: 'msg' }); return J(res, 200, { ok: 1 }); }
+  if (p === '/api/admin/chat-read' && m === 'POST') { b = await body(req); const c = await chatOf(b.cid); if (c) { c.msgs.forEach(x => x.read = true); await T.patch('chats', { cid: eq(c.cid) }, { msgs: c.msgs }); } return J(res, 200, { ok: 1 }); }
+  if ((mm = p.match(/^\/api\/admin\/chat\/(\w+)\/(reply|close)$/)) && m === 'POST') { const c = await chatOf(mm[1]); if (!c) return bad(res, 'Conversa não encontrada.', 404); b = await body(req); if (mm[2] === 'reply') { if (!S(b.text)) return bad(res, 'Mensagem vazia.'); c.msgs.push({ from: 'admin', text: S(b.text, 1000), t: Date.now(), read: false }); c.status = 'open'; c.mode = 'human'; } else c.status = 'closed'; await touch(c); return J(res, 200, { ok: 1 }); }
   if (p === '/api/admin/door' && m === 'POST') { b = await body(req); const w = S(b.word, 60).toLowerCase(); if (w.length < 4) return bad(res, 'Use pelo menos 4 caracteres.'); const salt = rid(8); await putSetting('door', { salt, hash: hash(w, salt) }); await audit(a.username, 'palavra do atalho alterada', ''); return J(res, 200, { ok: 1 }); }
 
   /* arquivos originais (visualização no painel) */
@@ -511,29 +705,30 @@ async function admApi(req, res, u, p) {
   /* fotos e vídeos */
   if (p === '/api/admin/item' && m === 'POST') {
     b = await body(req);
+    const dropfansProductId = S(b.dropfansProductId, 128).trim();
+    const dropfansAmountCents = b.dropfansAmountCents == null || b.dropfansAmountCents === '' ? null : Math.round(+b.dropfansAmountCents);
+    if ((dropfansProductId && !/^[A-Za-z0-9_-]{1,128}$/.test(dropfansProductId)) ||
+        (dropfansProductId && (!Number.isSafeInteger(dropfansAmountCents) || dropfansAmountCents < 500 || dropfansAmountCents > 75000)) ||
+        (!dropfansProductId && dropfansAmountCents != null)) {
+      return bad(res, 'Configure um ID de produto Dropfans válido e o valor correspondente entre US$ 5 e US$ 750.');
+    }
     const d = {
       title: S(b.title, 100), price_cents: cl(b.price), preview: up(b.preview), cover: up(b.cover),
-      teaser: up(b.teaser), duration: Math.max(0, Math.round(+b.duration || 0)), published: !!b.published
+      teaser: up(b.teaser), duration: Math.max(0, Math.round(+b.duration || 0)), published: !!b.published,
+      dropfans_product_id: dropfansProductId || null, dropfans_amount_cents: dropfansProductId ? dropfansAmountCents : null
     };
     if (!d.title) return bad(res, 'Informe o título.'); if (d.published && !(d.price_cents > 0)) return bad(res, 'Defina um preço maior que zero para publicar.');
     const x0 = b.id && await T.one('items', { id: eq(sid(b.id)) });
-    if (b.bio) d.bio = S(b.bio, 600); else if (x0 && x0.bio) d.bio = '';
     if (x0) { const [r] = await T.patch('items', { id: eq(x0.id) }, d); return J(res, 200, toItem(r)); }
-    const list = (Array.isArray(b.files) && b.files.length ? b.files : [b.file]).slice(0, 1000).map(f => base(S(f, 80))), file = list.join(','), type = list.length && list.every(f => /\.(mp4|webm|mov)$/i.test(f)) ? 'video' : 'photo'; if (!(await T.one('profiles', { id: eq(sid(b.profileId)) }))) return bad(res, 'Escolha o perfil.');
-    if (!list.length || !list.every(f => /^[\w.\-]{3,80}$/.test(f))) return bad(res, 'Envie o arquivo.'); try { for (let k = 0; k < list.length; k += 10) await Promise.all(list.slice(k, k + 10).map(f => supa.storage.sign('originals', f, 30))); } catch { return bad(res, 'Envie o arquivo.'); }
+    const type = b.type === 'video' ? 'video' : 'photo', file = base(S(b.file, 80)); if (!(await T.one('profiles', { id: eq(sid(b.profileId)) }))) return bad(res, 'Escolha o perfil.');
+    if (!/^[\w.\-]{3,80}$/.test(file)) return bad(res, 'Envie o arquivo.'); try { await supa.storage.sign('originals', file, 30); } catch { return bad(res, 'Envie o arquivo.'); }
     const [r] = await T.insert('items', [{ id: rid(5), profile_id: sid(b.profileId), type, original_file: file, ...d }]); await audit(a.username, type === 'video' ? 'vídeo adicionado' : 'foto adicionada', d.title); return J(res, 200, toItem(r));
   }
   if ((mm = p.match(/^\/api\/admin\/item\/(\w+)$/)) && m === 'DELETE') { const x = await T.one('items', { id: eq(mm[1]) }); if (x) { await delItem(toItem(x)); await audit(a.username, 'item excluído', x.title); } return J(res, 200, { ok: 1 }); }
 
   /* pedidos, pagamentos e liberações */
   if ((mm = p.match(/^\/api\/admin\/order\/(\w+)\/(confirm|reject|revoke)$/)) && m === 'POST') {
-    if (mm[2] === 'confirm') {
-      const r0 = await T.one('orders', { id: eq(mm[1]) }); if (!r0) return bad(res, 'Pedido não encontrado.', 404);
-      if (r0.status !== 'pending') return bad(res, 'Este pedido não está pendente.');
-      const bc = await body(req);
-      if (!(await T.rpc('confirm_order', { p_order: r0.id, p_by: a.username, p_note: S(bc.note, 200), p_source: 'admin', p_auth_id: rid(8) }))) return bad(res, 'Não foi possível confirmar.');
-      await audit(a.username, 'pagamento confirmado manualmente', r0.code); push(sse.admins, { t: 'order' }); return J(res, 200, { ok: 1 });
-    }
+    if (mm[2] === 'confirm') return bad(res, 'A confirmação de pagamento só é aceita pelo webhook Dropfans assinado.', 403);
     const r = await T.one('orders', { id: eq(mm[1]) }); if (!r) return bad(res, 'Pedido não encontrado.', 404); b = await body(req); const o = toOrder(r), note = S(b.note, 200);
     if (mm[2] === 'revoke') { if (o.status !== 'paid') return bad(res, 'Só é possível revogar pedidos pagos.'); if (!note) return bad(res, 'Informe o motivo da revogação.'); if (!(await T.rpc('revoke_access', { p_order: o.id, p_by: a.username, p_note: note }))) return bad(res, 'Não foi possível revogar.'); await audit(a.username, 'acesso revogado', o.code + ' ' + note); return J(res, 200, { ok: 1 }); }
     if (mm[2] !== 'reject') return bad(res, 'Operação inválida.', 400);
@@ -541,13 +736,28 @@ async function admApi(req, res, u, p) {
     const got = await T.patch('orders', { id: eq(o.id), status: eq('pending') }, { status: 'rejected', paid_by: a.username, note });
     if (got.length) {
       await T.patch('payments', { order_id: eq(o.id) }, { status: 'rejected', note });
-      await T.patch('provider_payments', { order_id: eq(o.id), status: eq('pending') }, { status: 'failed', updated_at: iso(Date.now()) });
-      orderEvent(o.id, 'pending', 'rejected', a.username, note); await audit(a.username, 'pedido recusado', o.code);
+      await T.patch('dropfans_payments', { order_id: eq(o.id), status: eq('pending') }, { status: 'failed', updated_at: iso(Date.now()) });
+      await release(o); orderEvent(o.id, 'pending', 'rejected', a.username, note); await audit(a.username, 'pedido recusado', o.code);
     }
     return J(res, 200, { ok: 1 });
   }
-  if (p === '/api/admin/authorize' && m === 'POST') return bad(res, 'A liberação sem pagamento foi desativada; o conteúdo só é liberado após a confirmação do pagamento.', 403);
+  if (p === '/api/admin/authorize' && m === 'POST') return bad(res, 'A liberação manual foi desativada; o conteúdo só é liberado após webhook assinado.', 403);
 
+  /* ao vivo */
+  if (p === '/api/admin/service' && m === 'POST') {
+    b = await body(req); const d = { name: S(b.name, 80), description: S(b.desc, 500), price_cents: cl(b.price), duration_min: Math.max(1, Math.round(+b.duration || 30)), conditions: S(b.conditions, 500), active: !!b.active }; if (!d.name) return bad(res, 'Informe o nome da modalidade.'); if (d.active && !(d.price_cents > 0)) return bad(res, 'Defina um preço maior que zero para ativar.');
+    const ex = b.id && await T.one('live_services', { id: eq(sid(b.id)) }); let r; if (ex) [r] = await T.patch('live_services', { id: eq(ex.id) }, d); else [r] = await T.insert('live_services', [{ id: rid(5), ...d }]);
+    await audit(a.username, 'modalidade salva', r.name); return J(res, 200, toService(r, [])); }
+  if ((mm = p.match(/^\/api\/admin\/service\/(\w+)$/)) && m === 'DELETE') { const x = await T.one('live_services', { id: eq(mm[1]) }); if (x) { if ((await T.count('orders', { service_id: eq(x.id), status: eq('pending') })) > 0) return bad(res, 'Há pedidos pendentes nesta modalidade. Resolva-os antes de excluir.'); await T.del('live_services', { id: eq(x.id) }); await audit(a.username, 'modalidade excluída', x.name); } return J(res, 200, { ok: 1 }); }
+  if ((mm = p.match(/^\/api\/admin\/service\/(\w+)\/slot$/)) && m === 'POST') { const x = await T.one('live_services', { id: eq(mm[1]) }); b = await body(req); if (!x) return bad(res, 'Modalidade não encontrada.', 404); const at = Math.round(+b.at); if (!(at > Date.now())) return bad(res, 'Escolha uma data e hora futuras.'); if (await T.one('live_slots', { service_id: eq(x.id), at: eq(iso(at)) })) return bad(res, 'Esse horário já existe.'); await T.insert('live_slots', [{ id: rid(4), service_id: x.id, at: iso(at) }]); return J(res, 200, { ok: 1 }); }
+  if ((mm = p.match(/^\/api\/admin\/service\/(\w+)\/slot\/(\w+)$/)) && m === 'DELETE') { const s = await T.one('live_slots', { id: eq(mm[2]), service_id: eq(mm[1]) }); if (s) { if (s.order_id) return bad(res, 'Horário reservado por um pedido.'); await T.del('live_slots', { id: eq(s.id) }); } return J(res, 200, { ok: 1 }); }
+  if (p === '/api/admin/live' && m === 'POST') { b = await body(req); const old = await setting('live_loop'), url = up(b.loop); await putSetting('live_loop', { url, on: !!b.loopOn }); if (old.url && old.url !== url) await rmPub(old.url); await audit(a.username, 'transmissão configurada', ''); return J(res, 200, { ok: 1 }); }
+  if (p === '/api/admin/robot' && m === 'POST') {
+    b = await body(req); const R = { enabled: !!b.enabled, humanAvailable: !!b.humanAvailable, start: S(b.start, 30), msgPaid: S(b.msgPaid, 300), msgHuman: S(b.msgHuman, 300), msgNoHuman: S(b.msgNoHuman, 300), msgFallback: S(b.msgFallback, 300), nodes: {} };
+    Object.entries(b.nodes || {}).slice(0, 60).forEach(([k, n]) => { if (!/^[a-z0-9_]{1,30}$/.test(k)) return; R.nodes[k] = { text: S(n.text, 1500), type: ['prices', 'human'].includes(n.type) ? n.type : '', go: ['fotos', 'videos', 'live', 'chat', 'compra'].includes(n.go) ? n.go : '', options: (Array.isArray(n.options) ? n.options : []).slice(0, 8).map(o => ({ label: S(o.label, 60), next: S(o.next, 30) })).filter(o => o.label) }; });
+    if (!R.nodes[R.start]) return bad(res, 'A mensagem inicial precisa existir.'); for (const n of Object.values(R.nodes)) for (const o of n.options) if (!R.nodes[o.next]) return bad(res, 'Uma resposta aponta para uma mensagem que não existe: ' + o.next);
+    await putSetting('robot', R); await audit(a.username, 'robô configurado', ''); return J(res, 200, { ok: 1 });
+  }
 
   /* envio de arquivos: validado em pasta temporária e só então enviado ao Storage */
   if (p === '/api/admin/upload' && m === 'PUT') {
@@ -572,6 +782,12 @@ async function admApi(req, res, u, p) {
     });
     return;
   }
+  if (p === '/api/admin/site' && m === 'POST') {
+    b = await body(req); const cfg = await settings(['site_draft']), s = { ...cfg.site_draft }; ['brand', 'welcome'].forEach(k => { if (b[k] != null) s[k] = S(b[k], 120); }); if (b.howto != null) s.howto = S(b.howto, 3000); if (b.cover != null) s.cover = up(b.cover);
+    if (b.areas) s.areas = { fotos: !!b.areas.fotos, videos: !!b.areas.videos, live: !!b.areas.live, chat: !!b.areas.chat }; if (b.counters != null) s.counters = !!b.counters; await putSetting('site_draft', s); await audit(a.username, 'rascunho visual salvo', ''); return J(res, 200, { ok: 1 });
+  }
+  if (p === '/api/admin/publish' && m === 'POST') { const cfg = await settings(['site_draft']); await putSetting('site_live', cfg.site_draft); await audit(a.username, 'site publicado', ''); return J(res, 200, { ok: 1 }); }
+  if (p === '/api/admin/discard' && m === 'POST') { const cfg = await settings(['site_live']); await putSetting('site_draft', cfg.site_live); await audit(a.username, 'alterações canceladas', ''); return J(res, 200, { ok: 1 }); }
   bad(res, 'Rota não encontrada.', 404);
 }
 
@@ -604,26 +820,13 @@ const srv = http.createServer(async (req, res) => {
       const o = await T.one('orders', { id: eq(oid), item_id: eq(mm[1]), status: eq('paid') }); if (!o) return deny();
       const au = await T.one('authorizations', { order_id: eq(oid), account_id: eq(o.account_id), item_id: eq(o.item_id), revoked_at: isNull }); if (!au || !o.account_id || !o.item_id || String(au.email || '').toLowerCase() !== String(o.email || '').toLowerCase()) return deny();
       const it = await T.one('items', { id: eq(mm[1]) }); if (!it) return deny();
-      const fl = String(it.original_file).split(',').filter(Boolean), nth = Math.max(0, parseInt(u.searchParams.get('n'), 10) || 0); if (nth >= fl.length) return deny();
-      if (u.searchParams.get('dl') === '1') res.setHeader('Content-Disposition', 'attachment; filename="' + ((String(it.title || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'goldrex') + '-' + (nth + 1) + path.extname(fl[nth]).toLowerCase()) + '"');
-      return pipeUpstream(req, res, await openPrivateMedia('originals', base(fl[nth]), req.headers.range), MIME[path.extname(fl[nth]).toLowerCase()]);
+      return pipeUpstream(req, res, await openPrivateMedia('originals', base(it.original_file), req.headers.range), MIME[path.extname(it.original_file).toLowerCase()]);
     }
-    if (p === '/admin.webmanifest') {/* só entrega para quem já está logado no painel (não revela o endereço secreto) */
-      const row = await adminCredentialRow(); if (!(await adminSessionOf(req, row && row.value))) return bad(res, 'Não encontrado.', 404);
-      res.writeHead(200, { 'Content-Type': 'application/manifest+json', 'Cache-Control': 'no-store' });
-      return res.end(JSON.stringify({ name: 'GOLDREX Admin', short_name: 'Admin', start_url: ADMIN_PATH, scope: '/', display: 'standalone', background_color: '#07030c', theme_color: '#07030c', icons: [{ src: '/icon-192.png', sizes: '192x192', type: 'image/png' }, { src: '/icon-512.png', sizes: '512x512', type: 'image/png' }] }));
-    }
-    // Bloqueia explicitamente a antiga rota de recuperação, mesmo se um deploy
-    // por cópia deixar um JS obsoleto no diretório public/js.
-    if (p === '/recuperar' || p === '/js/recuperar.js' || p.startsWith('/acesso/')) {
-      res.writeHead(404, { 'Cache-Control': 'no-store' });
-      return res.end('404');
-    }
-    let f = p === '/' ? 'index.html' : p === ADMIN_PATH || p === ADMIN_PATH + '/' ? 'admin.html' : p.startsWith('/pagamento/') ? 'pagamento.html' : p === '/privacidade' ? 'privacidade.html' : p === '/termos' ? 'termos.html' : p.slice(1);
+    let f = p === '/' ? 'index.html' : p === ADMIN_PATH || p === ADMIN_PATH + '/' ? 'admin.html' : p.startsWith('/acesso/') ? 'acesso.html' : p.startsWith('/pagamento/') ? 'pagamento.html' : p === '/privacidade' ? 'privacidade.html' : p === '/termos' ? 'termos.html' : p === '/recuperar' ? 'recuperar.html' : p.slice(1);
     if (f === 'admin.html' && !(p === ADMIN_PATH || p === ADMIN_PATH + '/')) return bad(res, 'Não encontrado.', 404);
-    if (f === 'admin.html' || f === 'pagamento.html') res.setHeader('X-Robots-Tag', 'noindex');
+    if (f === 'admin.html' || f === 'acesso.html' || f === 'pagamento.html' || f === 'recuperar.html') res.setHeader('X-Robots-Tag', 'noindex');
     const fp = path.join(PUB, f); if (!fp.startsWith(PUB + path.sep)) return bad(res, 'proibido', 403);
-    sendFile(req, res, fp, MIME[path.extname(fp)] || 'application/octet-stream', 'no-store');
+    sendFile(req, res, fp, MIME[path.extname(fp)] || 'application/octet-stream', 'no-cache');
   } catch (e) {
     logErr('erro na requisição ' + req.method + ' ' + String(req.url).split('?')[0], e); if (res.headersSent || !res.writable) return;
     if (e && [400, 408, 413].includes(e.status) && !(e instanceof SupaError)) return bad(res, e.message, e.status);
@@ -634,13 +837,13 @@ const srv = http.createServer(async (req, res) => {
 srv.requestTimeout = 0;/* envios grandes (vídeos) precisam de tempo; leitura de JSON tem prazo próprio */
 srv.on('error', e => { console.error(e.code === 'EADDRINUSE' ? 'A porta ' + PORT + ' já está em uso (talvez o GOLDREX já esteja rodando).' : 'Erro no servidor: ' + e.message); process.exit(1); });
 srv.on('clientError', (e, sock) => { try { sock.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n'); } catch { } });
-let closing = false; const shutdown = (why, code) => { if (closing) return; closing = true; console.log('\nEncerrando (' + why + ')…'); try { srv.close(); } catch { } sse.admins.forEach(r => { try { r.end(); } catch { } }); setTimeout(() => { try { srv.closeAllConnections && srv.closeAllConnections(); } catch { } }, 1500).unref(); setTimeout(() => process.exit(code), 4000).unref(); srv.on('close', () => process.exit(code)); };
+let closing = false; const shutdown = (why, code) => { if (closing) return; closing = true; console.log('\nEncerrando (' + why + ')…'); try { srv.close(); } catch { } sse.users.forEach(x => x.forEach(r => { try { r.end(); } catch { } })); sse.admins.forEach(r => { try { r.end(); } catch { } }); setTimeout(() => { try { srv.closeAllConnections && srv.closeAllConnections(); } catch { } }, 1500).unref(); setTimeout(() => process.exit(code), 4000).unref(); srv.on('close', () => process.exit(code)); };
 process.on('SIGINT', () => shutdown('SIGINT', 0)); process.on('SIGTERM', () => shutdown('SIGTERM', 0));
 process.on('uncaughtException', e => { logErr('erro inesperado', e); shutdown('erro inesperado', 1); });
 process.on('unhandledRejection', e => { logErr('promessa rejeitada', e); shutdown('promessa rejeitada', 1); });
 srv.listen(...(HOST ? [PORT, HOST] : [PORT]), () => {
   console.log('GOLDREX em http://localhost:' + PORT + (ADMIN_PATH === '/admin' ? '  |  painel: http://localhost:' + PORT + '/admin' : '  |  painel: no endereço definido em ADMIN_PATH'));
-  console.log('Pagamento: Pix com QR Code automático (o administrador confirma em Pedidos).');
+  console.log('DropFans: integração aguardando documentação oficial; o onboarding não processa cobranças.');
   T.get('settings', { select: 'key', limit: 1 })
     .then(() => console.log('Supabase: conexão OK.'))
     .catch(e => {
