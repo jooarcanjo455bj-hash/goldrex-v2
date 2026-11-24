@@ -328,7 +328,12 @@ async function pubApi(req, res, u, p) {
   /* --- pedidos --- */
   if (p === '/api/order' && m === 'POST') {
     if (limited(ip, 'co', 20)) return bad(res, 'Muitas tentativas. Aguarde um minuto.', 429); await sweep();
-    const ss = await sessionOf(req); if (!ss) return bad(res, 'Entre na sua conta para comprar.', 401, { needLogin: true });
+    let ss = await sessionOf(req);
+    if (!ss) {/* sem conta: o primeiro pedido cria um convidado invisível, preso a este navegador */
+      if (limited(ip, 'gu', 15, 60 * 60e3)) return bad(res, 'Muitas tentativas. Aguarde alguns minutos.', 429);
+      const [ga] = await T.insert('accounts', [{ id: crypto.randomUUID(), email: 'convidado-' + crypto.randomBytes(4).toString('hex') }]);
+      startSession(res, ga); ss = { account: ga };
+    }
     const acc = ss.account, b = await body(req);
     if (!b.itemId) return bad(res, 'Pedido inválido.');
     const it = await T.one('items', { id: eq(sid(b.itemId)), published: eq(true) }), pr = it && await T.one('profiles', { id: eq(it.profile_id), published: eq(true) });
@@ -344,7 +349,7 @@ async function pubApi(req, res, u, p) {
       catch (e) { logErr('registro do pagamento do pedido ' + o.code, e); return bad(res, 'Seu pedido foi criado, mas não foi possível preparar o pagamento. Tente novamente em instantes.', 503, { retryable: true, token: o.token }); }
     }
     push(sse.admins, { t: 'order' });
-    return J(res, 200, { token: o.token });
+    return J(res, 200, { token: o.token, me: meOut(acc) });
   }
   let mm;
   const tokenGuard = () => limited(ip, 'ot', 120) || isBlocked('tk:' + ip);
@@ -600,6 +605,7 @@ const srv = http.createServer(async (req, res) => {
       const au = await T.one('authorizations', { order_id: eq(oid), account_id: eq(o.account_id), item_id: eq(o.item_id), revoked_at: isNull }); if (!au || !o.account_id || !o.item_id || String(au.email || '').toLowerCase() !== String(o.email || '').toLowerCase()) return deny();
       const it = await T.one('items', { id: eq(mm[1]) }); if (!it) return deny();
       const fl = String(it.original_file).split(',').filter(Boolean), nth = Math.max(0, parseInt(u.searchParams.get('n'), 10) || 0); if (nth >= fl.length) return deny();
+      if (u.searchParams.get('dl') === '1') res.setHeader('Content-Disposition', 'attachment; filename="' + ((String(it.title || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'goldrex') + '-' + (nth + 1) + path.extname(fl[nth]).toLowerCase()) + '"');
       return pipeUpstream(req, res, await openPrivateMedia('originals', base(fl[nth]), req.headers.range), MIME[path.extname(fl[nth]).toLowerCase()]);
     }
     if (p === '/admin.webmanifest') {/* só entrega para quem já está logado no painel (não revela o endereço secreto) */

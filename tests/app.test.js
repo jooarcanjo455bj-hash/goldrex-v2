@@ -78,7 +78,6 @@ test('3. compra por Pix manual: pedido, "já paguei", confirmação do admin e l
   assert.equal((await browser().get('/api/site')).json.photos.length, 1);
 
   S.c = browser(); await S.c.post('/api/auth/signup', { user: 'joao', password: 'senha123', password2: 'senha123', termsAccepted: true });
-  assert.equal((await browser().post('/api/order', { itemId: item.json.id })).status, 401, 'sem conta não compra');
   const ord = await S.c.post('/api/order', { itemId: item.json.id }); assert.equal(ord.status, 200); S.token = ord.json.token;
   const pay = (await S.c.get('/api/pagamento/' + S.token)).json;
   assert.deepEqual([pay.status, pay.amountCents, pay.pixKey, pay.pixReceiver, pay.claimed], ['pending', 1500, 'pix@goldrex.test', 'Recebedor Teste', false]);
@@ -205,3 +204,20 @@ test('9. painel: pedido só vai para "Aguardando confirmação" depois que o cli
   assert.equal(ord.claimed, true, 'depois do "Já paguei" vai para confirmação');
 });
 
+
+test('10. compra sem conta: convidado invisível, compras ficam no navegador e dá para baixar o arquivo', async () => {
+  const items = (await S.admin.get('/api/admin/data')).json.items, item = items.find(i => i.published && i.price > 0 && !i.mixed && i.files.length === 1);
+  assert.ok(item, 'item para comprar');
+  const c = browser();
+  assert.equal((await c.post('/api/my', {})).json.orders.length, 0, 'sem compras ainda');
+  const o = await c.post('/api/order', { itemId: item.id });
+  assert.equal(o.status, 200, 'comprou sem criar conta: ' + JSON.stringify(o.json)); assert.ok(o.json.token); assert.match(o.json.me.user, /^convidado-[0-9a-f]{8}$/);
+  assert.match((await c.get('/api/site')).json.me.user, /^convidado-/, 'o navegador lembra do convidado');
+  const my = (await c.post('/api/my', {})).json; assert.equal(my.orders.length, 1, 'compra aparece em Minhas compras');
+  const adm = (await S.admin.get('/api/admin/data')).json.orders.find(x => x.id !== undefined && /^convidado-/.test(x.user)); assert.ok(adm, 'admin vê o convidado');
+  assert.equal((await S.admin.post('/api/admin/order/' + adm.id + '/confirm', {})).status, 200);
+  const m = (await c.post('/api/my', {})).json.orders[0].media; assert.ok(m && m.urls.length === 1, 'arquivo liberado');
+  assert.equal((await c.get(m.urls[0])).status, 200);
+  const d = await c.get(m.urls[0] + '&dl=1'); assert.equal(d.status, 200); assert.match(d.headers.get('content-disposition') || '', /attachment; filename="[\w-]+-1\.(jpg|mp4)"/, 'baixar: ' + d.headers.get('content-disposition'));
+  const other = browser(); assert.equal((await other.post('/api/my', {})).json.orders.length, 0, 'outro aparelho não vê a compra');
+});
